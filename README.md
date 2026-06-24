@@ -16,7 +16,7 @@ PhotoScribe requires two free pieces of software in addition to the app itself.
 
 Grab the latest build from the **[releases page](https://github.com/repomonkey/PhotoScribe/releases/latest)**.
 
-**macOS:** Download `PhotoScribe.dmg`, open it, and drag PhotoScribe to your Applications folder. That's it — no Python, no Terminal, no setup.
+**macOS (Apple Sillicon ONLY):** Download `PhotoScribe.dmg`, open it, and drag PhotoScribe to your Applications folder. That's it — no Python, no Terminal, no setup.
 
 > **First launch only:** macOS will ask if you're sure you want to open it. Click Open. This is normal for any app downloaded outside the Mac App Store and won't happen again.
 
