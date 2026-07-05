@@ -795,6 +795,12 @@ class MetadataWriter:
             if os.path.isfile(bundled):
                 return bundled
 
+        # Check next to this script (dev / source installs)
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        local_exe = os.path.join(script_dir, exe)
+        if os.path.isfile(local_exe):
+            return local_exe
+
         found = shutil.which("exiftool")
         if found:
             return found
@@ -1176,7 +1182,12 @@ class MetadataWriter:
 # ─────────────────────────────────────────────────────────
 
 class MetadataWriteWorker(QThread):
-    """Writes metadata to files in a background thread."""
+    """Writes metadata to files in a background thread.
+
+    Uses ExifTool's -stay_open batch mode (single persistent process) for
+    regular files, giving per-file progress callbacks.  Sidecar items are
+    handled individually (they need -o flag logic).
+    """
     progress = Signal(int, int)  # current, total
     file_done = Signal(str, bool, str)  # filename, success, error_msg
     finished_writing = Signal(int, int)  # success_count, error_count
@@ -1196,15 +1207,102 @@ class MetadataWriteWorker(QThread):
         success_count = 0
         error_count = 0
 
-        for i, (filepath, metadata) in enumerate(self.items):
+        exiftool = MetadataWriter.find_exiftool()
+        if not exiftool:
+            for i, (filepath, _) in enumerate(self.items):
+                self.file_done.emit(os.path.basename(filepath), False,
+                                    "ExifTool not found")
+                error_count += 1
+                self.progress.emit(i + 1, total)
+            self.finished_writing.emit(success_count, error_count)
+            return
+
+        # Separate sidecar items from regular items
+        regular_items = []
+        sidecar_items = []
+        for filepath, metadata in self.items:
+            p = Path(filepath)
+            if self.use_sidecar and p.suffix.lower() in RAW_EXTENSIONS:
+                sidecar_items.append((filepath, metadata))
+            else:
+                regular_items.append((filepath, metadata))
+
+        progress_idx = 0
+
+        # ── Process regular items using -stay_open batch mode ──
+        if regular_items:
             try:
-                MetadataWriter.write_metadata(
-                    filepath, metadata,
-                    backup=self.backup,
-                    append_keywords=self.append_keywords,
-                    skip_existing=self.skip_existing,
-                    use_sidecar=self.use_sidecar,
+                proc = _popen(
+                    [exiftool, "-stay_open", "True", "-@", "-"],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+
+                for filepath, metadata in regular_items:
+                    try:
+                        arg_lines = self._build_args_for_file(
+                            filepath, metadata, exiftool
+                        )
+                        arg_lines.append(filepath)
+                        arg_lines.append("-execute")
+
+                        proc.stdin.write("\n".join(arg_lines) + "\n")
+                        proc.stdin.flush()
+
+                        # Read exiftool's per-file response (ends with {ready})
+                        output_lines = []
+                        while True:
+                            line = proc.stdout.readline()
+                            if not line:
+                                break
+                            line = line.strip()
+                            if line == "{ready}":
+                                break
+                            output_lines.append(line)
+
+                        output_text = " ".join(output_lines)
+                        if ("error" in output_text.lower()
+                                and "0 image files updated" in output_text):
+                            raise RuntimeError(output_text)
+
+                        success_count += 1
+                        self.file_done.emit(
+                            os.path.basename(filepath), True, "")
+
+                    except Exception as e:
+                        error_count += 1
+                        self.file_done.emit(
+                            os.path.basename(filepath), False, str(e))
+
+                    progress_idx += 1
+                    self.progress.emit(progress_idx, total)
+
+                # Close the batch session
+                proc.stdin.write("-stay_open\nFalse\n")
+                proc.stdin.flush()
+                proc.wait(timeout=30)
+
+            except Exception as e:
+                # If the process itself failed, report remaining files as errors
+                for filepath, _ in regular_items[progress_idx:]:
+                    error_count += 1
+                    self.file_done.emit(
+                        os.path.basename(filepath), False,
+                        f"Batch process error: {e}")
+                    progress_idx += 1
+                    self.progress.emit(progress_idx, total)
+
+        # ── Process sidecar items individually ──
+        for filepath, metadata in sidecar_items:
+            try:
+                MetadataWriter._write_sidecar(
+                    Path(filepath), metadata,
                     adobe_naming=self.adobe_naming,
+                    skip_existing=self.skip_existing,
+                    append_keywords=self.append_keywords,
                 )
                 success_count += 1
                 self.file_done.emit(os.path.basename(filepath), True, "")
@@ -1212,9 +1310,60 @@ class MetadataWriteWorker(QThread):
                 error_count += 1
                 self.file_done.emit(os.path.basename(filepath), False, str(e))
 
-            self.progress.emit(i + 1, total)
+            progress_idx += 1
+            self.progress.emit(progress_idx, total)
 
         self.finished_writing.emit(success_count, error_count)
+
+    def _build_args_for_file(self, filepath, metadata, exiftool):
+        """Build exiftool arg lines for a single file within the batch.
+
+        Does NOT include the filepath or -execute terminator — those are
+        appended by the caller.
+        """
+        arg_lines = []
+
+        if not self.backup:
+            arg_lines.append("-overwrite_original")
+
+        # Read existing metadata if needed for skip/append logic
+        existing_title, existing_caption, existing_keywords = "", "", []
+        if self.skip_existing or self.append_keywords:
+            existing_title, existing_caption, existing_keywords = \
+                MetadataWriter.read_existing_metadata(filepath)
+
+        # Title
+        if not (self.skip_existing and existing_title):
+            arg_lines.append(f"-IPTC:ObjectName={metadata.title}")
+            arg_lines.append(f"-XMP:Title={metadata.title}")
+
+        # Caption
+        if not (self.skip_existing and existing_caption):
+            arg_lines.append(f"-IPTC:Caption-Abstract={metadata.caption}")
+            arg_lines.append(f"-XMP:Description={metadata.caption}")
+            arg_lines.append(f"-EXIF:ImageDescription={metadata.caption}")
+
+        # Keywords
+        kw_list = MetadataWriter._norm_keywords(metadata.keywords)
+        if self.append_keywords:
+            existing_lower = {k.lower() for k in existing_keywords}
+            new_keywords = [
+                kw for kw in kw_list
+                if kw.lower() not in existing_lower
+            ]
+            for kw in new_keywords:
+                arg_lines.append(f"-IPTC:Keywords+={kw}")
+                arg_lines.append(f"-XMP:Subject+={kw}")
+        else:
+            # Clear then set — exiftool processes args in order within a
+            # single -execute block, so "= then +=" works atomically.
+            arg_lines.append("-IPTC:Keywords=")
+            arg_lines.append("-XMP:Subject=")
+            for kw in kw_list:
+                arg_lines.append(f"-IPTC:Keywords+={kw}")
+                arg_lines.append(f"-XMP:Subject+={kw}")
+
+        return arg_lines
 
 
 # ─────────────────────────────────────────────────────────
@@ -3314,7 +3463,8 @@ class PhotoScribe(QMainWindow):
         self.progress_bar.setVisible(False)
         self.write_btn.setEnabled(True)
         self.status_label.setText(f"Written: {success_count} OK, {error_count} errors")
-        self._write_worker = None
+        # Defer cleanup — the thread is still winding down when this signal fires
+        QTimer.singleShot(500, lambda: setattr(self, '_write_worker', None))
         QMessageBox.information(
             self, "Complete",
             f"Metadata written to {success_count} file(s).\n"
