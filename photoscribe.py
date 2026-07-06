@@ -1355,13 +1355,14 @@ class MetadataWriteWorker(QThread):
                 arg_lines.append(f"-IPTC:Keywords+={kw}")
                 arg_lines.append(f"-XMP:Subject+={kw}")
         else:
-            # Clear then set — exiftool processes args in order within a
-            # single -execute block, so "= then +=" works atomically.
+            # Replace mode: use plain = for each keyword. ExifTool processes
+            # args in order, so the first = clears the list and subsequent =
+            # assignments append to it within the same -execute block.
             arg_lines.append("-IPTC:Keywords=")
             arg_lines.append("-XMP:Subject=")
             for kw in kw_list:
-                arg_lines.append(f"-IPTC:Keywords+={kw}")
-                arg_lines.append(f"-XMP:Subject+={kw}")
+                arg_lines.append(f"-IPTC:Keywords={kw}")
+                arg_lines.append(f"-XMP:Subject={kw}")
 
         return arg_lines
 
