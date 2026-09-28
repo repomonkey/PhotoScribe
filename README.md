@@ -33,7 +33,7 @@ PhotoScribe needs a local AI backend running on your computer. This is what actu
 [LM Studio](https://lmstudio.ai) is a polished app (Mac and Windows) for running local AI models. Download it from **[lmstudio.ai](https://lmstudio.ai)**, install it, then:
 
 1. Open LM Studio and go to the **Discover** tab
-2. Search for **gemma-3** and download a vision model — `gemma-3-12b` for best quality, `gemma-3-4b` for lighter machines
+2. Search for **gemma-4** and download a model: `gemma-4-12b` for most machines, `gemma-4-e4b` for lighter ones. On a Mac, choose an MLX build
 3. Go to the **Local Server** tab (the `<->` icon on the left) and click **Start Server**
 
 In PhotoScribe's Settings tab, change the URL to `http://localhost:1234` and click Refresh.
@@ -45,19 +45,47 @@ In PhotoScribe's Settings tab, change the URL to `http://localhost:1234` and cli
 Download from **[ollama.com/download](https://ollama.com/download)**. Once installed, open Terminal and pull a model:
 
 ```
-ollama pull gemma3:12b    # best quality, ~8GB RAM
-ollama pull gemma3:4b     # lighter, ~3GB RAM
+ollama pull gemma4:12b-it-qat    # most machines, ~7.2GB
+ollama pull gemma4:e4b-it-qat    # lighter, ~6.1GB
 ```
 
 Ollama uses `http://localhost:11434` (the PhotoScribe default). It starts automatically at login.
 
 ---
 
-> **Which model?** On an M-series Mac with 16GB+ RAM, a 12b model gives noticeably better results. On 8GB machines, the 4b model is faster and still solid. The download is 3–8GB and only happens once — everything runs offline after that.
+### Choosing a model matters more than any other setting
 
-**Not sure which to pick?** Click **Recommend Model** (top-right of Settings). PhotoScribe detects your GPU/RAM and suggests the best Gemma model for your machine — with the exact name to search for in LM Studio, or a one-click pull for Ollama.
+The model you run decides how fast PhotoScribe is and how good its captions are, far more than anything you set inside the app. Choose badly and a folder that should take two minutes takes an hour.
+
+Being able to read images is not enough to make a model a good fit. Plenty of models accept photos, and LM Studio and Ollama will happily load one that's far too big for your computer. It will still work, which is what makes this easy to miss. It will just be very slow, because a model that doesn't fit in memory gets read back from disk while it writes, again and again. Measured on a 32GB M2 Max MacBook Pro with the same photos:
+
+| Model | Size on disk | Speed | Time per photo |
+|---|---|---|---|
+| Gemma 4 12B | 6.3GB | 33 tokens a second | about 8s |
+| Gemma 4 26B-A4B | 15GB | 5–6 tokens a second | 20–30s |
+| Qwen 3.8 27B | 15GB | 3–6 tokens a second, after starting near 17 | 20–70s |
+
+The two larger models didn't write noticeably better captions for this job in testing. They were just three to eight times slower. Pick the model that fits with room to spare, not the biggest one that loads.
+
+As a guide:
+
+| Your computer | Model |
+|---|---|
+| 8GB Mac | Gemma 4 E2B |
+| 16GB Mac, or a graphics card with 8GB | Gemma 4 E4B |
+| 24–32GB Mac, or a 12–16GB graphics card | Gemma 4 12B |
+| 48GB or larger Mac, or a 24GB graphics card | Gemma 4 26B-A4B |
+
+A Mac shares its memory between the model, the system and everything else you have open, Lightroom and your browser included, so it needs more headroom than the model's size suggests. On a Mac, choose an MLX build in LM Studio.
+
+**Not sure which to pick?** Click **Recommend Model** (top-right of Settings). PhotoScribe detects your graphics memory and RAM and suggests the model that fits, with the exact name to search for in LM Studio, or a one-click pull for Ollama.
 
 ![Model recommendation](screenshot-recommend.png)
+
+#### Running slowly? It's almost certainly the model
+
+A model that fits your computer writes at 15 tokens a second or more. One that doesn't falls to single figures, and nothing errors to tell you why. PhotoScribe watches for this and writes a warning to the **Log** tab when generation drops below 8 tokens a second. If you see it, or PhotoScribe just feels slow, switch to the model Recommend Model suggests before changing anything else.
+
 
 ### 3. ExifTool — writes metadata to your files
 
@@ -130,6 +158,18 @@ In the **Folder Presets** tab you can define rules: *if a folder name contains X
 
 The default prompt works well for most photography, with built-in presets for Landscape, Event, and Product. Edit the prompt freely, then manage your own presets from the dropdown — **Save As** to create one, **Update** to overwrite, **Delete** to remove. Custom presets persist between sessions; the built-in ones can't be deleted, only overridden.
 
+### Outputs: captions for different destinations
+
+The **Caption written to the file** setting decides what the title, caption and keywords stored in the photo are for:
+
+- **Catalogue**, the default: factual and searchable.
+- **Stock**: literal titles, 25 to 45 keywords ordered most important first, no brand names or praise, and the editorial caption format when a photo shows people or brands.
+- **Flickr**: Flickr reads the title, caption and keywords from the file on upload, so these are written as a gallery description and tags.
+
+Tick any of Instagram, Facebook, Threads / Bluesky, Mastodon and Alt text under **Also write posts for**, then press **Write posts** on a photo in Results. The posts are written for that photo alone, without changing its title, caption or keywords, so you only spend the time on photos you'll actually share. Each has a copy button and a character count that turns red past the platform's limit, and they're included in CSV exports. Tick **Write posts for every photo during Generate** if you'd rather have them for the whole batch, which takes considerably longer. Posts are never written into the photo, because those platforms strip embedded metadata on upload and hashtags don't belong in your catalogue.
+
+**Write posts in the first person** makes them read as though you're sharing your own photo. PhotoScribe keeps that first person to reactions to the photo and tells the model not to invent where you were, when, or how often you go there, but read posts before you use them, as you would anything a model writes.
+
 ### Keyword vocabulary
 
 If you need consistent keywording across your catalogue, paste in your keyword list (one per line, or comma-separated). The AI will prefer terms from your vocabulary where applicable. You can also load a vocabulary from a text file.
@@ -165,7 +205,7 @@ If you have a separate machine with a large GPU (or a Spark), PhotoScribe can co
 Ollama isn't running. Click the Ollama icon in your menu bar to start it, or reinstall from [ollama.com](https://ollama.com). The status indicator at the top right of PhotoScribe will turn green once it connects.
 
 **No models appear in the dropdown**
-You haven't pulled a model yet. Open Terminal and run `ollama pull gemma3:12b` (or `gemma3:4b` for a smaller model). PhotoScribe will detect it automatically — click Refresh next to the model dropdown.
+You haven't pulled a model yet. Open Terminal and run `ollama pull gemma4:12b-it-qat` (or `gemma4:e4b-it-qat` for a smaller one). PhotoScribe will detect it automatically — click Refresh next to the model dropdown.
 
 **"ExifTool required" dialog**
 Click the "Download Installer" button in the dialog — it takes you straight to the ExifTool macOS package. Install it, restart PhotoScribe, and the warning won't appear again.
@@ -174,7 +214,7 @@ Click the "Download Installer" button in the dialog — it takes you straight to
 This is unusual as rawpy is bundled with the app. If it persists with a specific file, try exporting it as DNG from your camera software first.
 
 **Generation is slow**
-On a Mac with 8GB RAM and a 12b model, the model is partially being swapped in and out of memory. Switch to `gemma3:4b` for much faster processing. Speed is primarily limited by RAM, not CPU/GPU speed.
+Almost always a model that's too big for your memory. PhotoScribe logs a warning when generation drops below 8 tokens a second, which is the tell. Switch to the model **Recommend Model** suggests; a smaller model that fits is several times faster than a larger one that doesn't. Writing posts for every photo during Generate also adds a lot of time, so use **Write posts** in Results for just the photos you'll share.
 
 **Metadata doesn't appear in Lightroom after writing**
 Lightroom caches metadata. Select the photos and choose **Metadata → Read Metadata from File** to force a re-read.

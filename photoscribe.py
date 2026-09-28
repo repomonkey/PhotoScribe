@@ -60,7 +60,7 @@ def _popen(*args, **kwargs):
 
 
 # Single source of truth for the app version (the build reads this too).
-APP_VERSION = "1.6.3"
+APP_VERSION = "1.7.0"
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGridLayout, QLabel, QPushButton, QTextEdit, QLineEdit, QComboBox,
@@ -70,11 +70,11 @@ from PySide6.QtWidgets import (
     QAbstractItemView, QStyledItemDelegate, QStyle
 )
 from PySide6.QtCore import (
-    Qt, Signal, QThread, QSize, QMimeData, QTimer, QSettings, QUrl
+    Qt, Signal, QThread, QSize, QMimeData, QTimer, QSettings, QUrl, QRectF
 )
 from PySide6.QtGui import (
     QPixmap, QImage, QDragEnterEvent, QDropEvent, QFont, QColor,
-    QPalette, QIcon, QAction, QPainter, QFontDatabase
+    QPalette, QIcon, QAction, QPainter, QFontDatabase, QPen, QPainterPath
 )
 
 
@@ -465,6 +465,9 @@ class PhotoMetadata:
     # AI's — these flags let the UI mark it as "kept".
     title_kept: bool = False
     caption_kept: bool = False
+    # Ready-to-post text for social platforms, keyed by POST_TARGETS id. Shown
+    # in Results with a copy button; never written into the photo.
+    posts: dict = field(default_factory=dict)
 
 @dataclass
 class PhotoItem:
@@ -475,6 +478,75 @@ class PhotoItem:
     status: str = "pending"  # pending, processing, done, error
     error_msg: str = ""
 
+
+# ─────────────────────────────────────────────────────────
+# Output styles
+# ─────────────────────────────────────────────────────────
+
+# How the caption written INTO the photo is styled. That field is read by
+# Lightroom, Flickr, WordPress and the stock agencies, so these change the
+# title, caption and keywords themselves. "catalogue" is the long-standing
+# default and adds nothing to the prompt.
+FILE_STYLES = [
+    ("catalogue", "Catalogue (factual, searchable)", ""),
+    ("stock", "Stock (Adobe Stock, Shutterstock, Alamy)",
+     "This metadata is for stock photography agencies such as Adobe Stock, "
+     "Shutterstock and Alamy, whose buyers find photos by searching. "
+     "Title: a plain, literal statement of what the photo shows, up to about "
+     "ten words, with no artistic or poetic phrasing. "
+     "Caption: one or two factual sentences describing the subject, the "
+     "setting and any action, worded the way a buyer would search for it. "
+     "Keywords: give 25 to 45 keywords, overriding any smaller number asked "
+     "for above, ordered most important first: the main subject, then the "
+     "setting and location, then concepts, mood and uses. Use no brand names, "
+     "logos or trademarks, and no subjective praise such as 'stunning' or "
+     "'beautiful'. If the photo shows identifiable people, recognisable "
+     "brands or a news event it can only be licensed as editorial; in that "
+     "case begin the caption with the place and date in the form "
+     "'[Town], [Region], [Country] - [day month year]: ' and then the factual "
+     "description, using only a place and date that were provided to you."),
+    ("flickr", "Flickr (read from the file on upload)",
+     "This metadata will be uploaded to Flickr, which reads the title, "
+     "caption and keywords straight from the file. Title: evocative but "
+     "accurate, up to about eight words. Caption: two to four sentences, "
+     "warmer and more descriptive than a catalogue entry (the scene, the "
+     "light, the mood), as you would write under a photo in a gallery. "
+     "Keywords become Flickr tags: give 15 to 25, including any place names "
+     "at several levels (town, region, country) as separate tags."),
+]
+FILE_STYLE_IDS = [sid for sid, _, _ in FILE_STYLES]
+
+# Extra, ready-to-paste text generated alongside the metadata. These platforms
+# strip embedded metadata on upload, so writing this into the photo would do
+# nothing for them and leave hashtags in the catalogue for good. They live in
+# PhotoMetadata.posts and are shown in Results with a copy button instead.
+# (id, label, character limit or None, instructions)
+POST_TARGETS = [
+    ("instagram", "Instagram", 2200,
+     "an Instagram caption: open with a short line that makes someone stop "
+     "scrolling, follow it with two or three conversational sentences about "
+     "the photo, then a blank line and 3 to 5 relevant hashtags built from "
+     "the subject and the place."),
+    ("facebook", "Facebook", None,
+     "a Facebook post: two to four warm, story-led sentences about the "
+     "photo, natural rather than promotional, with no more than two "
+     "hashtags. It may end with a light question that invites comments."),
+    ("threads_bluesky", "Threads / Bluesky", 300,
+     "a Threads or Bluesky post: one or two short, punchy sentences, 280 "
+     "characters or fewer in total including any hashtags, with no more "
+     "than two hashtags."),
+    ("mastodon", "Mastodon", 500,
+     "a Mastodon post: one to three sentences, then 2 to 4 hashtags written "
+     "in CamelCase (#GoldenHour rather than #goldenhour) so screen readers "
+     "can say them. 450 characters or fewer in total."),
+    ("alt_text", "Alt text", 150,
+     "alt text for screen readers: a plain, literal description of what is "
+     "visible, 125 characters or fewer, with no hashtags and no opinions, "
+     "and not starting with 'Image of' or 'Photo of'."),
+]
+POST_TARGET_IDS = [pid for pid, _, _, _ in POST_TARGETS]
+POST_TARGET_LABELS = {pid: label for pid, label, _, _ in POST_TARGETS}
+POST_TARGET_LIMITS = {pid: limit for pid, _, limit, _ in POST_TARGETS}
 
 # ─────────────────────────────────────────────────────────
 # Ollama API worker thread
@@ -494,11 +566,23 @@ class OllamaWorker(QThread):
     # How many of those hints to show at all — no point pasting in forty.
     _MAX_TAG_HINTS = 12
 
+    # Below this many tokens a second (averaged over the whole request), the
+    # model is almost certainly too big for the memory it has and is being
+    # read back from disk as it runs. Measured on an M2 Max with 32GB: Gemma 4
+    # 12B ran at 33 tok/s; a 27B and a 26B-A4B that didn't fit ran at 3-6.
+    _SLOW_TOKENS_PER_SEC = 8.0
+    # Needs a reasonably long answer to judge, or start-up time dominates.
+    _SLOW_MIN_TOKENS = 60
+    # Warn once per session, not once per photo.
+    _slow_warned = False
+
     def __init__(self, photos, model, prompt, context, ollama_url,
                  keywords_list=None, backend="ollama", max_tokens=2048,
                  describe_people=True, skip_existing=False,
                  gps_lookup=False, has_manual_location=False,
-                 exif_date=False, has_manual_date=False):
+                 exif_date=False, has_manual_date=False,
+                 file_style="catalogue", post_targets=None, first_person=False,
+                 posts_only=False):
         super().__init__()
         self.photos = photos
         self.model = model
@@ -521,6 +605,15 @@ class OllamaWorker(QThread):
         # stamped on every shot in it.
         self.exif_date = exif_date
         self.has_manual_date = has_manual_date
+        # What the file caption is for, and which posts to write alongside it.
+        self.file_style = file_style if file_style in FILE_STYLE_IDS else "catalogue"
+        wanted = set(post_targets or [])
+        self.post_targets = [pid for pid in POST_TARGET_IDS if pid in wanted]
+        self.first_person = first_person
+        # Write posts for photos that already have their metadata, without
+        # regenerating the title, caption or keywords (Results → Write posts).
+        self.posts_only = posts_only and bool(self.post_targets)
+        self._last_rate = None
         self._logged_no_location = False
         self._cancelled = False
         self.batch_total_time = 0.0
@@ -639,7 +732,25 @@ class OllamaWorker(QThread):
                 "rather than guessing one."
             )
 
-        parts.append(self.prompt.strip())
+        if self.posts_only:
+            # The metadata already exists: give it to the model so the posts
+            # stay consistent with it, and ask for nothing else.
+            meta = photo.metadata if photo is not None else None
+            if meta and (meta.title or meta.caption):
+                parts.append(
+                    "The metadata for this photo has already been written. "
+                    f'Title: "{meta.title}". Caption: "{meta.caption}". '
+                    "Keep the posts consistent with it."
+                )
+        else:
+            parts.append(self.prompt.strip())
+
+        # The destination of the file caption. Appended after the user's own
+        # prompt so prompt presets keep working: presets describe what is in
+        # the photo, this describes where the metadata is going.
+        style_text = dict((sid, txt) for sid, _, txt in FILE_STYLES)[self.file_style]
+        if style_text and not self.posts_only:
+            parts.append(style_text)
 
         persons = []
         if self.describe_people:
@@ -705,11 +816,53 @@ class OllamaWorker(QThread):
                 "the keywords yourself, from what is actually in the photo."
             )
 
-        if self.keywords_list:
+        if self.keywords_list and not self.posts_only:
             vocab = ", ".join(self.keywords_list[:200])
             parts.append(
                 f"\nWhen generating keywords, prefer terms from this vocabulary "
                 f"where applicable: {vocab}"
+            )
+
+        if self.post_targets:
+            instr = {pid: text for pid, _, _, text in POST_TARGETS}
+            lines = "\n".join(f'- "{pid}": {instr[pid]}' for pid in self.post_targets)
+            if self.first_person:
+                # Phrased as a requirement on EVERY post: asked more gently, a
+                # model makes one post first person and lets the rest drift
+                # into pronoun-free past tense ("The water was so still").
+                # First person invites the model to invent the photographer's
+                # life: "I stopped by today" on a 2015 photo, "one of my
+                # favourite spots". Reactions to the photo are fine; claims
+                # about when, how often, or what happened are not.
+                voice = ("Write every post except the alt text as the "
+                         "photographer sharing their own photo, in the first "
+                         "person: each of those posts must use 'I', 'my' or "
+                         "'me' at least once, in your own words and different "
+                         "in each post. Use the first person only for "
+                         "reactions to the photo, such as what you like about "
+                         "its light, colour or composition. Never narrate what "
+                         "you did, so no 'I was standing', 'I found', 'I "
+                         "stopped', 'I waited' or 'I took this from'. Don't "
+                         "say when it was taken relative to now ('today', "
+                         "'this evening'), don't claim you were alone, and "
+                         "don't claim it's a favourite or regular spot. The "
+                         "alt text stays neutral.")
+            else:
+                voice = ("Write the posts in a neutral voice, without 'I' or "
+                         "'we'.")
+            intro = ("Write the following ready-to-post text for sharing this "
+                     "photo" if self.posts_only else
+                     "As well as the title, caption and keywords, write the "
+                     "following ready-to-post text for sharing this photo")
+            parts.append(
+                intro + ', returned in a "posts" object under the key shown:\n'
+                + lines + "\n"
+                + voice + " The posts are separate from the metadata: never put "
+                "hashtags or emoji in the title, caption or keywords. Where a "
+                "location is given above, use it in the posts too. Do not "
+                "invent anything that isn't shown or given, such as how long "
+                "something took, what happened before or after, or anything "
+                "about the photographer's experience."
             )
 
         # Anti-confabulation: small vision models will happily invent a
@@ -727,11 +880,21 @@ class OllamaWorker(QThread):
             "better to be general and correct than specific and wrong."
         )
 
+        posts_fmt = ('"posts": {'
+                     + ", ".join(f'"{pid}": "..."' for pid in self.post_targets)
+                     + "}")
+        if self.posts_only:
+            fmt = "{" + posts_fmt + "}"
+        else:
+            fmt = ('{"title": "Short descriptive title", '
+                   '"caption": "Detailed description of the image in 1-3 sentences", '
+                   '"keywords": ["keyword1", "keyword2", "keyword3"]')
+            if self.post_targets:
+                fmt += ", " + posts_fmt
+            fmt += "}"
         parts.append(
             "\nRespond ONLY with valid JSON in this exact format, no other text:\n"
-            '{"title": "Short descriptive title", '
-            '"caption": "Detailed description of the image in 1-3 sentences", '
-            '"keywords": ["keyword1", "keyword2", "keyword3"]}'
+            + fmt
         )
         return "\n\n".join(parts)
 
@@ -888,6 +1051,46 @@ class OllamaWorker(QThread):
         },
     }
 
+    def _check_speed(self):
+        """Log a one-off warning when generation is crawling. That almost
+        always means the model doesn't fit in memory, which is otherwise
+        invisible: nothing errors, it just takes a minute per photo."""
+        if OllamaWorker._slow_warned or not self._last_rate:
+            return
+        tokens, secs = self._last_rate
+        if tokens < self._SLOW_MIN_TOKENS or secs <= 0:
+            return
+        rate = tokens / secs
+        if rate >= self._SLOW_TOKENS_PER_SEC:
+            return
+        OllamaWorker._slow_warned = True
+        self.log_message.emit(
+            f"Slow generation: {rate:.1f} tokens a second. That usually means "
+            f"the model ({self.model}) is too large for the memory available, "
+            "so parts of it are read back from disk as it runs. A smaller model "
+            "will be several times faster; Recommend Model suggests one that "
+            "fits this computer."
+        )
+
+    def _schema(self):
+        """The structured-output schema for this run. Identical to the base
+        schema unless posts were asked for, so the default path is unchanged;
+        with posts, each requested platform becomes a required string."""
+        if not self.post_targets:
+            return self._JSON_SCHEMA
+        import copy
+        sch = copy.deepcopy(self._JSON_SCHEMA)
+        sch["schema"]["properties"]["posts"] = {
+            "type": "object",
+            "properties": {pid: {"type": "string"} for pid in self.post_targets},
+            "required": list(self.post_targets),
+        }
+        sch["schema"]["required"] = ["title", "caption", "keywords", "posts"]
+        if self.posts_only:
+            sch["schema"]["properties"] = {"posts": sch["schema"]["properties"]["posts"]}
+            sch["schema"]["required"] = ["posts"]
+        return sch
+
     def _call_ollama(self, img_b64, full_prompt):
         """Ollama /api/chat format."""
         payload = {
@@ -906,7 +1109,7 @@ class OllamaWorker(QThread):
             "stream": False,
             # Constrain output to our schema (Ollama structured outputs). Stops
             # the model returning a prose/bulleted plan instead of JSON.
-            "format": self._JSON_SCHEMA["schema"],
+            "format": self._schema()["schema"],
             "options": {
                 "temperature": 0.3,
                 "num_predict": self.max_tokens,
@@ -917,6 +1120,7 @@ class OllamaWorker(QThread):
             "think": False,
         }
         url = f"{self.ollama_url}/api/chat"
+        started = time.monotonic()
         resp = requests.post(url, json=payload, timeout=180)
         # Fall back gracefully if the server rejects the schema in `format`
         # (older Ollama): retry with plain "json", then with no constraint.
@@ -927,7 +1131,12 @@ class OllamaWorker(QThread):
                 payload.pop("format", None)
                 resp = requests.post(url, json=payload, timeout=180)
         resp.raise_for_status()
-        return resp.json().get("message", {}).get("content", "")
+        body = resp.json()
+        # Ollama reports generation time itself; fall back to wall time.
+        tokens = body.get("eval_count") or 0
+        secs = (body.get("eval_duration") or 0) / 1e9 or (time.monotonic() - started)
+        self._last_rate = (tokens, secs)
+        return body.get("message", {}).get("content", "")
 
     def _call_openai(self, img_b64, full_prompt):
         """LM Studio / OpenAI-compatible chat format with vision."""
@@ -964,10 +1173,11 @@ class OllamaWorker(QThread):
             # wants json_schema, not the OpenAI json_object type.)
             "response_format": {
                 "type": "json_schema",
-                "json_schema": self._JSON_SCHEMA,
+                "json_schema": self._schema(),
             },
         }
         url = f"{self.ollama_url}/v1/chat/completions"
+        started = time.monotonic()
         resp = requests.post(url, json=payload, timeout=180)
         # Drop optional params one at a time if the backend rejects them, so an
         # older or stricter server still works rather than failing outright.
@@ -977,6 +1187,9 @@ class OllamaWorker(QThread):
                 resp = requests.post(url, json=payload, timeout=180)
         resp.raise_for_status()
         body = resp.json()
+        # The OpenAI endpoint has no timing, so rate over the whole request.
+        self._last_rate = (((body.get("usage") or {}).get("completion_tokens") or 0),
+                           time.monotonic() - started)
         choice = (body.get("choices") or [{}])[0]
         msg = choice.get("message", {}) or {}
         content = (msg.get("content") or "").strip()
@@ -996,9 +1209,10 @@ class OllamaWorker(QThread):
 
         call_fn = self._call_openai if self.backend == "openai" else self._call_ollama
 
-        # Build list of pending photo indices
+        # Build list of pending photo indices. Writing posts on demand runs on
+        # photos that are already done — that's the point of it.
         pending = [(i, photo) for i, photo in enumerate(self.photos)
-                   if photo.status != "done"]
+                   if self.posts_only or photo.status != "done"]
         if not pending:
             self.finished_all.emit()
             return
@@ -1089,11 +1303,31 @@ class OllamaWorker(QThread):
                             self.log_message.emit(f"Raw response was: {snippet}")
                             continue
 
-                        meta = PhotoMetadata(
-                            title=str(data.get("title") or "").strip(),
-                            caption=str(data.get("caption") or "").strip(),
-                            keywords=self._clean_keywords(data.get("keywords") or [])
-                        )
+                        posts = {}
+                        raw_posts = data.get("posts")
+                        if isinstance(raw_posts, dict):
+                            for pid in self.post_targets:
+                                val = raw_posts.get(pid)
+                                if val is not None and str(val).strip():
+                                    posts[pid] = str(val).strip()
+                        if self.posts_only and not posts:
+                            last_reason = "the response had no posts in it"
+                            continue
+                        missing = [POST_TARGET_LABELS[pid] for pid in self.post_targets
+                                   if pid not in posts]
+                        if missing:
+                            self.log_message.emit(
+                                f"No post returned for: {', '.join(missing)}")
+                        if self.posts_only:
+                            meta = PhotoMetadata(posts=posts)
+                        else:
+                            meta = PhotoMetadata(
+                                title=str(data.get("title") or "").strip(),
+                                caption=str(data.get("caption") or "").strip(),
+                                keywords=self._clean_keywords(data.get("keywords") or []),
+                                posts=posts,
+                            )
+                        self._check_speed()
                         break
 
                     if meta is None:
@@ -1106,7 +1340,7 @@ class OllamaWorker(QThread):
                     # title/caption is what actually gets written — so show that
                     # (marked "kept") in Results, not the AI's discarded one.
                     # (We still generate, because keywords are always produced.)
-                    if self.skip_existing:
+                    if self.skip_existing and not self.posts_only:
                         e_title, e_caption, _ = \
                             MetadataWriter.read_existing_metadata(photo.filepath)
                         if e_title:
@@ -2335,6 +2569,9 @@ class PhotoScribe(QMainWindow):
 
         self.photos: list[PhotoItem] = []
         self.worker: Optional[OllamaWorker] = None
+        # Separate from the batch worker: writes posts for one photo on demand.
+        self._posts_worker: Optional[OllamaWorker] = None
+        self._posts_photo: Optional[PhotoItem] = None
         self.settings = QSettings("PhotoScribe", "PhotoScribe")
         self._detected_folder_context: Optional[FolderContext] = None
         # Context fields we filled in ourselves, so Clear All can undo them
@@ -2608,6 +2845,71 @@ class PhotoScribe(QMainWindow):
 
         # Initialise prompt presets
         self._init_prompt_presets()
+
+        # Outputs: what the file caption is for, plus optional ready-to-post
+        # text for social platforms (shown in Results, never written to file).
+        outputs_group = QGroupBox("OUTPUTS")
+        outputs_layout = QVBoxLayout(outputs_group)
+        outputs_layout.setSpacing(10)
+
+        style_row = QHBoxLayout()
+        style_label = QLabel("Caption written to the file:")
+        style_label.setStyleSheet("color: #8f8d89; font-size: 12px;")
+        style_row.addWidget(style_label)
+        self.file_style_combo = QComboBox()
+        for sid, label, _ in FILE_STYLES:
+            self.file_style_combo.addItem(label, sid)
+        self.file_style_combo.setToolTip(
+            "What the title, caption and keywords written INTO the photo are\n"
+            "for. Lightroom, Flickr, WordPress and stock agencies all read them."
+        )
+        style_row.addWidget(self.file_style_combo)
+        style_row.addStretch()
+        outputs_layout.addLayout(style_row)
+
+        posts_label = QLabel("Also write posts for:")
+        posts_label.setStyleSheet("color: #8f8d89; font-size: 12px;")
+        outputs_layout.addWidget(posts_label)
+        posts_row = QHBoxLayout()
+        posts_row.setSpacing(18)
+        self.post_checks = {}
+        for pid, label, _, _ in POST_TARGETS:
+            cb = QCheckBox(label)
+            cb.toggled.connect(self._update_first_person_enabled)
+            self.post_checks[pid] = cb
+            posts_row.addWidget(cb)
+        posts_row.addStretch()
+        outputs_layout.addLayout(posts_row)
+
+        self.batch_posts_check = QCheckBox(
+            "Write posts for every photo during Generate"
+        )
+        self.batch_posts_check.setToolTip(
+            "Off: write posts one photo at a time from Results, only for the\n"
+            "photos you'll actually share. On: write them for the whole batch,\n"
+            "which takes considerably longer."
+        )
+        outputs_layout.addWidget(self.batch_posts_check)
+
+        self.first_person_check = QCheckBox(
+            "Write posts in the first person, as the photographer"
+        )
+        self.first_person_check.setToolTip(
+            "e.g. 'Caught this one just as the light went'. Off writes posts\n"
+            "in a neutral voice. Alt text is always neutral."
+        )
+        outputs_layout.addWidget(self.first_person_check)
+
+        outputs_hint = QLabel(
+            "Use Write posts on a photo in Results to write the ticked posts "
+            "for it. They are never written into the photo. Writing them for "
+            "every photo during Generate roughly doubles its time with all five."
+        )
+        outputs_hint.setObjectName("cardHint")
+        outputs_hint.setWordWrap(True)
+        outputs_layout.addWidget(outputs_hint)
+        settings_layout.addWidget(outputs_group)
+        self._update_first_person_enabled()
 
         # Batch context
         context_group = QGroupBox("BATCH CONTEXT")
@@ -2907,7 +3209,8 @@ class PhotoScribe(QMainWindow):
         # Right: detail/edit panel
         detail_widget = QWidget()
         detail_layout = QVBoxLayout(detail_widget)
-        detail_layout.setContentsMargins(8, 0, 0, 0)
+        # Right margin leaves room for the scroll bar beside the copy buttons.
+        detail_layout.setContentsMargins(8, 0, 14, 0)
         detail_layout.setSpacing(8)
 
         # Folder path in results
@@ -2928,6 +3231,10 @@ class PhotoScribe(QMainWindow):
         # Photo preview
         self.detail_preview = QLabel()
         self.detail_preview.setFixedHeight(380)
+        # Ignore the pixmap's width when sizing: otherwise a 720px preview
+        # forces the panel wider than its scroll area and the right-hand edge
+        # (including the copy buttons) is clipped off.
+        self.detail_preview.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self.detail_preview.setAlignment(Qt.AlignCenter)
         self.detail_preview.setStyleSheet(
             "background-color: #17171a; border: 1px solid #2a2a2f; "
@@ -2942,7 +3249,9 @@ class PhotoScribe(QMainWindow):
             "color: #7e7c78; font-size: 10px; font-weight: 600; "
             "letter-spacing: 1px; margin-top: 4px; border: none;"
         )
-        detail_layout.addWidget(self.detail_title_label)
+        detail_layout.addLayout(self._field_header(
+            self.detail_title_label,
+            self._make_copy_button(lambda: self.detail_title.text(), "title")))
         self.detail_title = QLineEdit()
         self.detail_title.setPlaceholderText("Title")
         self.detail_title.textChanged.connect(self._on_detail_edited)
@@ -2954,7 +3263,10 @@ class PhotoScribe(QMainWindow):
             "color: #7e7c78; font-size: 10px; font-weight: 600; "
             "letter-spacing: 1px; margin-top: 4px; border: none;"
         )
-        detail_layout.addWidget(self.detail_caption_label)
+        detail_layout.addLayout(self._field_header(
+            self.detail_caption_label,
+            self._make_copy_button(
+                lambda: self.detail_caption.toPlainText(), "caption")))
         self.detail_caption = QTextEdit()
         self.detail_caption.setPlaceholderText("Caption / description")
         self.detail_caption.setMinimumHeight(80)
@@ -2968,12 +3280,15 @@ class PhotoScribe(QMainWindow):
             "color: #7e7c78; font-size: 10px; font-weight: 600; "
             "letter-spacing: 1px; margin-top: 4px; border: none;"
         )
-        detail_layout.addWidget(kw_label)
+        detail_layout.addLayout(self._field_header(
+            kw_label,
+            self._make_copy_button(
+                lambda: self.detail_keywords.toPlainText(), "keywords")))
         self.detail_keywords = QTextEdit()
         self.detail_keywords.setPlaceholderText(
             "Comma-separated keywords"
         )
-        self.detail_keywords.setMinimumHeight(60)
+        self.detail_keywords.setMinimumHeight(80)
         self.detail_keywords.setMaximumHeight(120)
         self.detail_keywords.textChanged.connect(self._on_detail_edited)
         detail_layout.addWidget(self.detail_keywords)
@@ -2983,9 +3298,65 @@ class PhotoScribe(QMainWindow):
         self.kw_count_label.setStyleSheet("color: #5f5f66; font-size: 11px; border: none;")
         detail_layout.addWidget(self.kw_count_label)
 
+        # Posts: one box per platform, shown only when the photo has one.
+        self.posts_header = QLabel("POSTS · copy and paste, not written to the file")
+        self.posts_header.setStyleSheet(
+            "color: #d1935e; font-size: 10px; font-weight: 700; "
+            "letter-spacing: 1px; margin-top: 10px; border: none;"
+        )
+        self.write_posts_btn = QPushButton("Write posts")
+        self.write_posts_btn.setFixedHeight(26)
+        self.write_posts_btn.setStyleSheet("font-size: 11px; padding: 2px 12px;")
+        self.write_posts_btn.clicked.connect(self._write_posts_for_current)
+        posts_row = QHBoxLayout()
+        posts_row.setContentsMargins(0, 0, 0, 0)
+        posts_row.addWidget(self.posts_header)
+        posts_row.addStretch()
+        posts_row.addWidget(self.write_posts_btn)
+        self.posts_row_widget = QWidget()
+        self.posts_row_widget.setLayout(posts_row)
+        self.posts_row_widget.setVisible(False)
+        detail_layout.addWidget(self.posts_row_widget)
+        self.post_boxes = {}
+        for pid, label, limit, _ in POST_TARGETS:
+            box = QWidget()
+            box_layout = QVBoxLayout(box)
+            box_layout.setContentsMargins(0, 0, 0, 0)
+            box_layout.setSpacing(4)
+            name = QLabel(label.upper())
+            name.setStyleSheet(
+                "color: #7e7c78; font-size: 10px; font-weight: 600; "
+                "letter-spacing: 1px; margin-top: 4px; border: none;"
+            )
+            count = QLabel("")
+            count.setStyleSheet("color: #5f5f66; font-size: 11px; border: none;")
+            edit = QTextEdit()
+            # Tall enough to read a typical post without an inner scroll bar;
+            # the short formats get short boxes.
+            short = limit is not None and limit <= 300
+            edit.setMinimumHeight(78 if short else 128)
+            edit.setMaximumHeight(110 if short else 220)
+            edit.textChanged.connect(self._on_post_edited)
+            btn = self._make_copy_button(
+                lambda e=edit: e.toPlainText(), f"{label} post")
+            head = self._field_header(name, btn)
+            head.insertWidget(2, count)
+            box_layout.addLayout(head)
+            box_layout.addWidget(edit)
+            box.setVisible(False)
+            detail_layout.addWidget(box)
+            self.post_boxes[pid] = (box, edit, count, btn)
+
         detail_layout.addStretch()
 
-        results_splitter.addWidget(detail_widget)
+        # Scrollable, since a photo with several posts runs well past the
+        # height of the window.
+        detail_scroll = QScrollArea()
+        detail_scroll.setWidgetResizable(True)
+        detail_scroll.setFrameShape(QFrame.NoFrame)
+        detail_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        detail_scroll.setWidget(detail_widget)
+        results_splitter.addWidget(detail_scroll)
         results_splitter.setSizes([250, 500])
 
         results_layout.addWidget(results_splitter)
@@ -3122,6 +3493,18 @@ class PhotoScribe(QMainWindow):
         self.folder_context_check.setChecked(folder_context == "true")
         exif_date_fallback = self.settings.value("exif_date_fallback", "true")
         self.exif_date_fallback_check.setChecked(exif_date_fallback == "true")
+        idx = self.file_style_combo.findData(
+            self.settings.value("file_style", "catalogue"))
+        self.file_style_combo.setCurrentIndex(max(idx, 0))
+        saved_posts = set(filter(None, str(
+            self.settings.value("post_targets", "") or "").split(",")))
+        for pid, cb in self.post_checks.items():
+            cb.setChecked(pid in saved_posts)
+        self.first_person_check.setChecked(
+            self.settings.value("posts_first_person", "false") == "true")
+        self.batch_posts_check.setChecked(
+            self.settings.value("posts_in_batch", "false") == "true")
+        self._update_first_person_enabled()
         self._load_folder_presets()
 
     def _save_settings(self):
@@ -3159,6 +3542,18 @@ class PhotoScribe(QMainWindow):
             "exif_date_fallback",
             "true" if self.exif_date_fallback_check.isChecked() else "false"
         )
+        self.settings.setValue(
+            "file_style", self.file_style_combo.currentData() or "catalogue")
+        self.settings.setValue(
+            "post_targets", ",".join(self._selected_post_targets()))
+        self.settings.setValue(
+            "posts_first_person",
+            "true" if self.first_person_check.isChecked() else "false"
+        )
+        self.settings.setValue(
+            "posts_in_batch",
+            "true" if self.batch_posts_check.isChecked() else "false"
+        )
         self.settings.setValue("sidecar_naming", str(self.sidecar_naming_combo.currentIndex()))
         self.settings.setValue("response_length", str(self.response_length_combo.currentIndex()))
         self.settings.setValue(
@@ -3179,6 +3574,192 @@ class PhotoScribe(QMainWindow):
         event.accept()
 
     # ── Logging ──
+
+    def _worker_settings(self, post_targets, posts_only=False, photos=None):
+        """Everything a generation run needs from the UI, shared by Generate
+        and by Write posts so the two can't drift apart."""
+        max_tokens_map = {0: 2048, 1: 4096, 2: 8192}
+        base = 1024 if posts_only else max_tokens_map.get(
+            self.response_length_combo.currentIndex(), 2048)
+        return dict(
+            photos=self.photos if photos is None else photos,
+            model=self.model_combo.currentText(),
+            prompt=self.prompt_edit.toPlainText(),
+            context=self._get_context_string(),
+            ollama_url=self.ollama_url.text().rstrip("/"),
+            keywords_list=self._get_keywords_list(),
+            backend=getattr(self, "backend", "ollama"),
+            # Each post adds a few hundred tokens of output on top.
+            max_tokens=base + 300 * len(post_targets),
+            describe_people=self.describe_people_check.isChecked(),
+            skip_existing=self.skip_existing_check.isChecked(),
+            gps_lookup=self.gps_lookup_check.isChecked(),
+            has_manual_location=bool(
+                self.context_fields["ctx_location"].text().strip()),
+            exif_date=self.exif_date_fallback_check.isChecked(),
+            has_manual_date=bool(
+                self.context_fields["ctx_datetime"].text().strip()),
+            file_style=self.file_style_combo.currentData() or "catalogue",
+            post_targets=post_targets,
+            first_person=self.first_person_check.isChecked(),
+            posts_only=posts_only,
+        )
+
+    def _write_posts_for_current(self):
+        """Results → Write posts: write the ticked posts for the photo on
+        screen, leaving its title, caption and keywords alone."""
+        targets = self._selected_post_targets()
+        completed = self._get_completed_photos()
+        idx = self._current_result_index
+        if not targets or not (0 <= idx < len(completed)):
+            return
+        if (self.worker and self.worker.isRunning()) or \
+                (self._posts_worker and self._posts_worker.isRunning()):
+            self.status_label.setText("Wait for the current generation to finish")
+            return
+        if not self.model_combo.currentText():
+            self.status_label.setText("No model selected — click Refresh to connect")
+            return
+        photo = completed[idx]
+        self._posts_photo = photo
+        self._posts_worker = OllamaWorker(**self._worker_settings(
+            post_targets=targets, posts_only=True, photos=[photo]))
+        self._posts_worker.result.connect(self._on_posts_result)
+        self._posts_worker.log_message.connect(self.log)
+        self._posts_worker.finished_all.connect(self._on_posts_finished)
+        self.write_posts_btn.setEnabled(False)
+        self.write_posts_btn.setText("Writing posts…")
+        self.status_label.setText(f"Writing posts for {photo.filename}…")
+        self._posts_worker.start()
+
+    def _on_posts_result(self, index, result):
+        photo = getattr(self, "_posts_photo", None)
+        if photo is None:
+            return
+        if isinstance(result, PhotoMetadata):
+            # Merge: a rewrite replaces the platforms asked for and keeps any
+            # others the photo already had.
+            photo.metadata.posts.update(result.posts)
+            self._save_progress()
+            completed = self._get_completed_photos()
+            if 0 <= self._current_result_index < len(completed) and \
+                    completed[self._current_result_index] is photo:
+                self._load_detail(photo)
+            self.status_label.setText(f"Posts written for {photo.filename}")
+        else:
+            self.status_label.setText(f"Couldn't write posts: {result}")
+
+    def _on_posts_finished(self):
+        self._posts_photo = None
+        QTimer.singleShot(500, lambda: setattr(self, "_posts_worker", None))
+        self._update_write_posts_btn()
+
+    def _update_write_posts_btn(self, *_):
+        """Enabled only with a photo on screen and at least one post ticked."""
+        if not hasattr(self, "write_posts_btn"):
+            return
+        busy = bool(getattr(self, "_posts_worker", None)
+                    and self._posts_worker.isRunning())
+        completed = self._get_completed_photos() if hasattr(self, "photos") else []
+        idx = getattr(self, "_current_result_index", -1)
+        photo = completed[idx] if 0 <= idx < len(completed) else None
+        has_posts = bool(photo and (photo.metadata.posts or {}))
+        targets = self._selected_post_targets()
+        self.write_posts_btn.setText("Rewrite posts" if has_posts else "Write posts")
+        self.write_posts_btn.setEnabled(bool(photo and targets and not busy))
+        self.write_posts_btn.setToolTip(
+            "Write the posts ticked in Settings → Outputs for this photo."
+            if targets else
+            "Tick the posts you want in Settings → Outputs first."
+        )
+
+    def _selected_post_targets(self):
+        return [pid for pid in POST_TARGET_IDS if self.post_checks[pid].isChecked()]
+
+    def _update_first_person_enabled(self, *_):
+        """Voice and batch writing only matter when there's a post to write."""
+        any_posts = bool(self._selected_post_targets())
+        if hasattr(self, "first_person_check"):
+            self.first_person_check.setEnabled(any_posts)
+        if hasattr(self, "batch_posts_check"):
+            self.batch_posts_check.setEnabled(any_posts)
+        self._update_write_posts_btn()
+
+    @staticmethod
+    def _field_header(label, button):
+        """A field label with a copy button at the right-hand end."""
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(label)
+        row.addStretch()
+        row.addWidget(button)
+        return row
+
+    def _copy_icons(self):
+        """Painted (not font-glyph) icons, so they look the same on every OS:
+        two overlapping sheets for copy, a tick once copied."""
+        if getattr(self, "_icons", None):
+            return self._icons
+        def paint(draw, colour):
+            pm = QPixmap(32, 32)
+            pm.fill(Qt.transparent)
+            p = QPainter(pm)
+            p.setRenderHint(QPainter.Antialiasing)
+            p.scale(2, 2)
+            pen = QPen(QColor(colour))
+            pen.setWidthF(1.3)
+            p.setPen(pen)
+            p.setBrush(Qt.NoBrush)
+            draw(p)
+            p.end()
+            return QIcon(pm)
+        def sheets(p):
+            p.drawRoundedRect(QRectF(5.5, 5.5, 8, 8), 1.8, 1.8)
+            back = QPainterPath()
+            back.moveTo(4.5, 10.5)
+            back.lineTo(3.8, 10.5)
+            back.quadTo(2.5, 10.5, 2.5, 9.2)
+            back.lineTo(2.5, 3.8)
+            back.quadTo(2.5, 2.5, 3.8, 2.5)
+            back.lineTo(9.2, 2.5)
+            back.quadTo(10.5, 2.5, 10.5, 3.8)
+            back.lineTo(10.5, 4.5)
+            p.drawPath(back)
+        def tick(p):
+            path = QPainterPath()
+            path.moveTo(3.5, 8.5)
+            path.lineTo(6.5, 11.5)
+            path.lineTo(12.5, 4.5)
+            p.drawPath(path)
+        self._icons = (paint(sheets, "#8f8d89"), paint(tick, "#7bc9a0"))
+        return self._icons
+
+    def _make_copy_button(self, get_text, what):
+        """A small copy-to-clipboard button. Shows a tick for a moment after
+        copying, so it's clear something happened."""
+        copy_icon, done_icon = self._copy_icons()
+        btn = QToolButton()
+        btn.setIcon(copy_icon)
+        btn.setIconSize(QSize(16, 16))
+        btn.setFixedSize(26, 22)
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.setToolTip(f"Copy {what}")
+        btn.setStyleSheet(
+            "QToolButton { border: none; background: transparent; "
+            "border-radius: 5px; padding: 2px; }"
+            "QToolButton:hover { background-color: #232326; }"
+        )
+        def do_copy():
+            text = get_text() or ""
+            if not text.strip():
+                return
+            QApplication.clipboard().setText(text)
+            btn.setIcon(done_icon)
+            QTimer.singleShot(1200, lambda: btn.setIcon(copy_icon))
+            if hasattr(self, "status_label"):
+                self.status_label.setText(f"Copied {what} to the clipboard")
+        btn.clicked.connect(do_copy)
+        return btn
 
     def _set_status_pill(self, text, state):
         """Update the header connection pill. `state` is on / off / wait —
@@ -3257,10 +3838,12 @@ class PhotoScribe(QMainWindow):
             self.model_combo.clear()
             self.model_combo.addItems(model_names)
 
-            # Default to gemma3:12b or first model
-            for i, name in enumerate(model_names):
-                if "gemma3:12b" in name or "gemma-3-12b" in name.lower():
-                    self.model_combo.setCurrentIndex(i)
+            # Default to a Gemma 12B if there is one (4, then 3), else the first.
+            for wanted in ("gemma4:12b", "gemma-4-12b", "gemma3:12b", "gemma-3-12b"):
+                hit = next((i for i, n in enumerate(model_names)
+                            if wanted in n.lower()), None)
+                if hit is not None:
+                    self.model_combo.setCurrentIndex(hit)
                     break
 
             n = len(model_names)
@@ -3365,6 +3948,10 @@ class PhotoScribe(QMainWindow):
         self.detail_caption.clear()
         self.detail_keywords.clear()
         self.kw_count_label.setText("")
+        for box, edit, _, _ in self.post_boxes.values():
+            edit.clear()
+            box.setVisible(False)
+        self.posts_row_widget.setVisible(False)
         self._updating_detail = False
         self.log("Cleared all photos")
 
@@ -3678,6 +4265,7 @@ class PhotoScribe(QMainWindow):
                     "title": photo.metadata.title,
                     "caption": photo.metadata.caption,
                     "keywords": photo.metadata.keywords,
+                    "posts": getattr(photo.metadata, "posts", {}) or {},
                 }
             if photo.error_msg:
                 entry["error_msg"] = photo.error_msg
@@ -3715,6 +4303,7 @@ class PhotoScribe(QMainWindow):
                         title=meta.get("title", ""),
                         caption=meta.get("caption", ""),
                         keywords=meta.get("keywords", []),
+                        posts=dict(meta.get("posts") or {}),
                     )
                     photo.status = "done"
                     restored += 1
@@ -3789,25 +4378,11 @@ class PhotoScribe(QMainWindow):
         # Headroom matters more than it looks: a reasoning model that ignores
         # the "no thinking" flag can spend 1000+ tokens before writing any
         # JSON, and a short ceiling truncates the answer mid-object.
-        max_tokens_map = {0: 2048, 1: 4096, 2: 8192}
-        self.worker = OllamaWorker(
-            photos=self.photos,
-            model=self.model_combo.currentText(),
-            prompt=self.prompt_edit.toPlainText(),
-            context=self._get_context_string(),
-            ollama_url=self.ollama_url.text().rstrip("/"),
-            keywords_list=self._get_keywords_list(),
-            backend=getattr(self, "backend", "ollama"),
-            max_tokens=max_tokens_map.get(self.response_length_combo.currentIndex(), 512),
-            describe_people=self.describe_people_check.isChecked(),
-            skip_existing=self.skip_existing_check.isChecked(),
-            gps_lookup=self.gps_lookup_check.isChecked(),
-            has_manual_location=bool(
-                self.context_fields["ctx_location"].text().strip()),
-            exif_date=self.exif_date_fallback_check.isChecked(),
-            has_manual_date=bool(
-                self.context_fields["ctx_datetime"].text().strip()),
-        )
+        # Posts are only written during the batch when asked to; otherwise
+        # they're written per photo from Results, where they're wanted.
+        batch_posts = (self._selected_post_targets()
+                       if self.batch_posts_check.isChecked() else [])
+        self.worker = OllamaWorker(**self._worker_settings(post_targets=batch_posts))
         self.worker.progress.connect(self._on_progress)
         self.worker.result.connect(self._on_result)
         self.worker.finished_all.connect(self._on_finished)
@@ -3974,6 +4549,16 @@ class PhotoScribe(QMainWindow):
         self.detail_caption_label.setStyleSheet(kept_style if c_kept else plain_style)
         kw_count = len(photo.metadata.keywords)
         self.kw_count_label.setText(f"{kw_count} keyword{'s' if kw_count != 1 else ''}")
+        posts = getattr(photo.metadata, "posts", None) or {}
+        for pid, (box, edit, _, _) in self.post_boxes.items():
+            text = posts.get(pid, "")
+            edit.setPlainText(text)
+            box.setVisible(bool(text))
+            self._update_post_count(pid)
+        # The header row carries the Write posts button, so it shows for any
+        # photo on screen, whether or not it has posts yet.
+        self.posts_row_widget.setVisible(True)
+        self._update_write_posts_btn()
         self._updating_detail = False
 
     def _load_preview(self, filepath: str):
@@ -4024,6 +4609,35 @@ class PhotoScribe(QMainWindow):
         photo.metadata.keywords = [k.strip() for k in kws_text.split(",") if k.strip()]
         kw_count = len(photo.metadata.keywords)
         self.kw_count_label.setText(f"{kw_count} keyword{'s' if kw_count != 1 else ''}")
+
+    def _on_post_edited(self):
+        """Sync edits in the post boxes back to the photo, and recount."""
+        for pid in self.post_boxes:
+            self._update_post_count(pid)
+        if self._updating_detail:
+            return
+        completed = self._get_completed_photos()
+        if self._current_result_index < 0 or self._current_result_index >= len(completed):
+            return
+        photo = completed[self._current_result_index]
+        for pid, (box, edit, _, _) in self.post_boxes.items():
+            # isHidden, not isVisible: the latter is False whenever the Results
+            # tab isn't the one on screen, which would silently drop edits.
+            if not box.isHidden():
+                photo.metadata.posts[pid] = edit.toPlainText()
+
+    def _update_post_count(self, pid):
+        """Character count under a post, red once it's over the platform limit."""
+        _, edit, count, _ = self.post_boxes[pid]
+        n = len(edit.toPlainText())
+        limit = POST_TARGET_LIMITS.get(pid)
+        if limit:
+            count.setText(f"{n} / {limit}")
+            colour = "#e2796a" if n > limit else "#5f5f66"
+        else:
+            count.setText(f"{n} characters")
+            colour = "#5f5f66"
+        count.setStyleSheet(f"color: {colour}; font-size: 11px; border: none;")
 
     def _results_prev(self):
         completed = self._get_completed_photos()
@@ -4149,17 +4763,23 @@ class PhotoScribe(QMainWindow):
             return
 
         import csv
+        # A column per platform that any exported photo actually has a post for.
+        post_cols = [pid for pid in POST_TARGET_IDS
+                     if any((getattr(p.metadata, "posts", None) or {}).get(pid)
+                            for p in completed)]
         with open(path, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(["Filename", "Filepath", "Title", "Caption", "Keywords"])
+            writer.writerow(["Filename", "Filepath", "Title", "Caption", "Keywords"]
+                            + [f"Post: {POST_TARGET_LABELS[pid]}" for pid in post_cols])
             for photo in completed:
+                posts = getattr(photo.metadata, "posts", None) or {}
                 writer.writerow([
                     photo.filename,
                     photo.filepath,
                     photo.metadata.title,
                     photo.metadata.caption,
                     "; ".join(photo.metadata.keywords),
-                ])
+                ] + [posts.get(pid, "") for pid in post_cols])
         self.log(f"Exported CSV: {path}")
         self.status_label.setText(f"CSV exported to {path}")
 
@@ -4224,10 +4844,16 @@ class PhotoScribe(QMainWindow):
                 photo = by_filename[filename]
 
             if photo:
+                posts = {}
+                for pid in POST_TARGET_IDS:
+                    val = (row.get(f"Post: {POST_TARGET_LABELS[pid]}") or "").strip()
+                    if val:
+                        posts[pid] = val
                 photo.metadata = PhotoMetadata(
                     title=title,
                     caption=caption,
                     keywords=keywords,
+                    posts=posts,
                 )
                 photo.status = "done"
                 matched += 1
@@ -4604,28 +5230,67 @@ class PhotoScribe(QMainWindow):
 
         return info
 
-    def _get_model_recommendation(self, info: dict) -> dict:
-        """Recommend best model based on hardware."""
-        vram = info.get("vram_mb") or 0
-        ram = info.get("ram_mb") or 0
-        effective = vram if vram > 0 else ram
+    # Gemma 4 lineup, sizes as listed in Ollama's library (QAT builds, which
+    # hold up best at 4-bit). Every Gemma 4 model reads images, and every one
+    # is a reasoning model — handled by switching reasoning off per request.
+    _GEMMA4 = {
+        "e2b": {"model": "gemma4:e2b-it-qat", "lm_studio": "gemma-4-e2b",
+                "desc": "Gemma 4 E2B", "size": "~4.3GB download"},
+        "e4b": {"model": "gemma4:e4b-it-qat", "lm_studio": "gemma-4-e4b",
+                "desc": "Gemma 4 E4B", "size": "~6.1GB download"},
+        "12b": {"model": "gemma4:12b-it-qat", "lm_studio": "gemma-4-12b",
+                "desc": "Gemma 4 12B", "size": "~7.2GB download"},
+        "26b": {"model": "gemma4:26b-a4b-it-qat", "lm_studio": "gemma-4-26b-a4b",
+                "desc": "Gemma 4 26B-A4B", "size": "~16GB download"},
+    }
 
-        if effective >= 28000:
-            return {"model": "gemma3:27b", "lm_studio": "gemma-3-27b-it",
-                    "desc": "Gemma 3 27B \u2014 best quality", "size": "~17GB download",
-                    "pull": "ollama pull gemma3:27b"}
-        elif effective >= 14000:
-            return {"model": "gemma3:12b", "lm_studio": "gemma-3-12b-it",
-                    "desc": "Gemma 3 12B \u2014 great quality/speed balance", "size": "~8GB download",
-                    "pull": "ollama pull gemma3:12b"}
-        elif effective >= 6000:
-            return {"model": "gemma3:4b", "lm_studio": "gemma-3-4b-it",
-                    "desc": "Gemma 3 4B \u2014 lightweight, still solid", "size": "~3GB download",
-                    "pull": "ollama pull gemma3:4b"}
+    def _get_model_recommendation(self, info: dict) -> dict:
+        """Recommend a model that fits with room to spare.
+
+        The old rule counted 70% of a Mac's memory as usable, which ignored
+        everything else running (Lightroom, a browser). A model that only just
+        fits gets read back from disk as it generates: on a 32GB M2 Max a 27B
+        and a 26B-A4B both ran at 3-6 tokens a second, against 14-19 for one
+        that fitted. So size by total memory with generous headroom."""
+        ram_gb = (info.get("ram_mb") or 0) / 1024
+        vram_gb = (info.get("vram_mb") or 0) / 1024
+        platform = info.get("platform") or ""
+
+        if platform == "apple_silicon":
+            # Unified memory is shared with the OS and every open app.
+            if ram_gb >= 46:
+                key, why = "26b", ("A mixture-of-experts model: 26B of knowledge, "
+                                   "but only about 4B used per word, so it runs "
+                                   "much faster than its size suggests.")
+            elif ram_gb >= 23:
+                key, why = "12b", ("Good captions, and small enough to stay in "
+                                   "memory alongside Lightroom and a browser.")
+            elif ram_gb >= 14:
+                key, why = "e4b", "Fits comfortably alongside your other apps."
+            else:
+                key, why = "e2b", "The smallest option; leaves room for the system."
+        elif vram_gb > 0:
+            # A discrete card holds the model on its own, but needs a couple of
+            # GB spare for the image and working memory.
+            if vram_gb >= 20:
+                key, why = "26b", ("Fits in your graphics memory with room to spare, "
+                                   "and only about 4B of it is used per word.")
+            elif vram_gb >= 10:
+                key, why = "12b", "Fits in your graphics memory with room to spare."
+            elif vram_gb >= 7.5:
+                # E4B is 6.1GB, so a 6GB card can't hold it with any room.
+                key, why = "e4b", "Fits in your graphics memory."
+            else:
+                key, why = "e2b", "The smallest option, for limited graphics memory."
         else:
-            return {"model": "gemma3:4b", "lm_studio": "gemma-3-4b-it",
-                    "desc": "Gemma 3 4B \u2014 smallest option", "size": "~3GB download",
-                    "pull": "ollama pull gemma3:4b"}
+            # No usable GPU: it runs on the processor, where size costs most.
+            key = "e4b" if ram_gb >= 16 else "e2b"
+            why = ("Running on the processor is slow at any size, so a small "
+                   "model keeps it bearable.")
+        rec = dict(self._GEMMA4[key])
+        rec["why"] = why
+        rec["pull"] = f"ollama pull {rec['model']}"
+        return rec
 
     def _recommend_model(self):
         """Detect hardware and show recommendation."""
@@ -4635,7 +5300,9 @@ class PhotoScribe(QMainWindow):
         hw_lines = []
         if info["gpu_name"]:
             hw_lines.append(f"GPU: {info['gpu_name']}")
-        if info["vram_mb"]:
+        # On Apple Silicon "VRAM" is only an estimate carved out of shared
+        # memory, and the recommendation no longer uses it, so don't show it.
+        if info["vram_mb"] and info.get("platform") != "apple_silicon":
             hw_lines.append(f"VRAM: {info['vram_mb'] / 1024:.1f} GB")
         if info["ram_mb"]:
             hw_lines.append(f"System RAM: {info['ram_mb'] / 1024:.1f} GB")
@@ -4654,17 +5321,22 @@ class PhotoScribe(QMainWindow):
         backend = getattr(self, "backend", "ollama")
         if backend == "openai":
             # LM Studio user
+            # MLX is Apple Silicon's native format in LM Studio; elsewhere a
+            # 4-bit GGUF build (QAT where offered) is the right choice.
+            build = ("Choose an MLX build, the native format for Apple Silicon "
+                     "(QAT or 4-bit)."
+                     if info.get("platform") == "apple_silicon" else
+                     "Choose a QAT or Q4_K_M build.")
             msg.setInformativeText(
-                f"Recommended: {rec['desc']}\n{rec['size']}\n\n"
+                f"Recommended: {rec['desc']}\n{rec['size']}\n{rec['why']}\n\n"
                 f"In LM Studio, go to the Discover tab and search for:\n"
-                f"  {rec['lm_studio']}\n\n"
-                f"Download a Q4_K_M quantized version for best results."
+                f"  {rec['lm_studio']}\n\n{build}"
             )
             msg.addButton("OK", QMessageBox.AcceptRole)
         else:
             # Ollama user
             msg.setInformativeText(
-                f"Recommended: {rec['desc']}\n{rec['size']}\n\n"
+                f"Recommended: {rec['desc']}\n{rec['size']}\n{rec['why']}\n\n"
                 f"Command: {rec['pull']}\n\n"
                 f"Click 'Pull Model' to download now, or 'Copy Command' to run manually."
             )

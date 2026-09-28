@@ -51,6 +51,33 @@ def make_jpeg(path):
     return path
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _isolated_settings(tmp_path_factory):
+    """Keep the test run away from the developer's real PhotoScribe settings.
+
+    The window loads its preferences on construction via
+    QSettings("PhotoScribe", "PhotoScribe"), and that constructor always opens
+    the native store (Qt ignores setDefaultFormat for it). So tests read, and
+    some once wrote, the live settings: they failed as soon as real posts were
+    ticked, and a GPS setting leaked into live prefs. Swap in a QSettings that
+    sends those named settings to a throwaway .ini instead."""
+    from PySide6.QtCore import QSettings
+    folder = str(tmp_path_factory.mktemp("qsettings"))
+
+    class _ThrowawaySettings(QSettings):
+        def __init__(self, *args, **kwargs):
+            if len(args) == 2 and all(isinstance(a, str) for a in args):
+                super().__init__(os.path.join(folder, f"{args[0]}-{args[1]}.ini"),
+                                 QSettings.IniFormat)
+            else:
+                super().__init__(*args, **kwargs)
+
+    patch = pytest.MonkeyPatch()
+    patch.setattr(photoscribe, "QSettings", _ThrowawaySettings)
+    yield
+    patch.undo()
+
+
 @pytest.fixture(scope="session")
 def qapp():
     """A QApplication for tests that instantiate QThread workers."""
@@ -1019,3 +1046,413 @@ class TestLoadTimeAutofill:
         w.gps_lookup_check.blockSignals(False)
         w._load_settings()
         assert w.gps_lookup_check.isChecked() is True
+
+
+# ── Output styles and social posts (v1.7.0) ───────────────────────
+
+class TestOutputPrompt:
+    """File caption styles change what's written INTO the photo; posts are
+    extra ready-to-paste text that must never reach the file."""
+
+    def _prompt(self, monkeypatch, **kw):
+        monkeypatch.setattr(MetadataWriter, "read_persons", lambda f: [])
+        monkeypatch.setattr(MetadataWriter, "read_keywords", lambda f: [])
+        w = make_worker(describe_people=False, **kw)
+        return w, w._build_prompt(PhotoItem(filepath="x.jpg", filename="x.jpg"))
+
+    def test_catalogue_adds_nothing(self, monkeypatch):
+        _, prompt = self._prompt(monkeypatch, file_style="catalogue")
+        assert "stock photography" not in prompt
+        assert "Flickr" not in prompt
+        assert '"posts"' not in prompt
+
+    def test_stock_style(self, monkeypatch):
+        _, prompt = self._prompt(monkeypatch, file_style="stock")
+        assert "stock photography" in prompt
+        assert "25 to 45 keywords" in prompt
+
+    def test_flickr_style(self, monkeypatch):
+        _, prompt = self._prompt(monkeypatch, file_style="flickr")
+        assert "Flickr" in prompt
+
+    def test_unknown_style_falls_back_to_catalogue(self, monkeypatch):
+        w, _ = self._prompt(monkeypatch, file_style="myspace")
+        assert w.file_style == "catalogue"
+
+    def test_posts_requested_in_prompt(self, monkeypatch):
+        _, prompt = self._prompt(monkeypatch,
+                                 post_targets=["instagram", "alt_text"])
+        assert '"instagram":' in prompt and '"alt_text":' in prompt
+        assert '"facebook"' not in prompt
+        # The format example carries the posts object too.
+        assert '"posts": {"instagram": "...", "alt_text": "..."}' in prompt
+        assert "never put hashtags or emoji in the title" in prompt
+
+    def test_post_order_is_canonical_and_unknowns_dropped(self, monkeypatch):
+        w, _ = self._prompt(monkeypatch,
+                            post_targets=["alt_text", "tiktok", "instagram"])
+        assert w.post_targets == ["instagram", "alt_text"]
+
+    def test_first_person_voice(self, monkeypatch):
+        _, prompt = self._prompt(monkeypatch, post_targets=["instagram"],
+                                 first_person=True)
+        assert "in the first person" in prompt
+
+    def test_neutral_voice_by_default(self, monkeypatch):
+        _, prompt = self._prompt(monkeypatch, post_targets=["instagram"])
+        assert "neutral voice" in prompt
+        assert "in the first person" not in prompt
+
+    def test_schema_unchanged_without_posts(self):
+        w = make_worker()
+        assert w._schema() is OllamaWorker._JSON_SCHEMA
+
+    def test_schema_requires_each_post(self):
+        w = make_worker(post_targets=["mastodon", "instagram"])
+        sch = w._schema()["schema"]
+        assert sch["required"] == ["title", "caption", "keywords", "posts"]
+        assert sch["properties"]["posts"]["required"] == ["instagram", "mastodon"]
+        # The shared base schema must not have been mutated.
+        assert "posts" not in OllamaWorker._JSON_SCHEMA["schema"]["properties"]
+
+    def test_openai_request_carries_posts_schema(self, monkeypatch):
+        seen = []
+        monkeypatch.setattr(photoscribe.requests, "post",
+                            lambda url, json=None, timeout=None: (seen.append(json), _Resp())[1])
+        make_worker(backend="openai", post_targets=["facebook"])._call_openai("img", "p")
+        props = seen[0]["response_format"]["json_schema"]["schema"]["properties"]
+        assert "facebook" in props["posts"]["properties"]
+
+
+class TestPostsInResults:
+    def _run(self, monkeypatch, reply, **kw):
+        monkeypatch.setattr(MetadataWriter, "read_persons", lambda f: [])
+        monkeypatch.setattr(MetadataWriter, "read_keywords", lambda f: [])
+        photo = PhotoItem(filepath="x.jpg", filename="x.jpg")
+        w = make_worker(photos=[photo], backend="openai", **kw)
+        monkeypatch.setattr(w, "_encode_image", lambda fp: "img")
+        monkeypatch.setattr(w, "_call_openai", lambda img, prompt: reply)
+        results, logs = [], []
+        w.result.connect(lambda i, r: results.append(r))
+        w.log_message.connect(logs.append)
+        w.run()
+        return results[0], logs
+
+    def test_posts_reach_the_result(self, qapp, monkeypatch):
+        reply = json.dumps({"title": "T", "caption": "C", "keywords": ["a"],
+                            "posts": {"instagram": " Golden hour #Gerroa ",
+                                      "alt_text": "A beach at sunset"}})
+        meta, _ = self._run(monkeypatch, reply,
+                            post_targets=["instagram", "alt_text"])
+        assert meta.posts == {"instagram": "Golden hour #Gerroa",
+                              "alt_text": "A beach at sunset"}
+
+    def test_unrequested_posts_are_ignored(self, qapp, monkeypatch):
+        reply = json.dumps({"title": "T", "caption": "C", "keywords": ["a"],
+                            "posts": {"instagram": "x", "facebook": "y"}})
+        meta, _ = self._run(monkeypatch, reply, post_targets=["instagram"])
+        assert meta.posts == {"instagram": "x"}
+
+    def test_missing_post_is_logged(self, qapp, monkeypatch):
+        reply = json.dumps({"title": "T", "caption": "C", "keywords": ["a"],
+                            "posts": {"instagram": "x"}})
+        meta, logs = self._run(monkeypatch, reply,
+                               post_targets=["instagram", "mastodon"])
+        assert "mastodon" not in meta.posts
+        assert any("No post returned for: Mastodon" in m for m in logs)
+
+
+@needs_exiftool
+class TestPostsNeverWrittenToFile:
+    def test_post_text_absent_from_every_tag(self, tmp_path):
+        img = make_jpeg(tmp_path / "p.jpg")
+        meta = PhotoMetadata(title="T", caption="C", keywords=["k"],
+                             posts={"instagram": "ZZPOSTMARKER #nope"})
+        MetadataWriter.write_metadata(str(img), meta, backup=False)
+        MetadataWriter.write_metadata_batch([(str(img), meta)], backup=False)
+        exiftool = MetadataWriter.find_exiftool()
+        r = photoscribe._run([exiftool, "-a", "-G1", "-j", str(img)],
+                             capture_output=True, text=True)
+        assert "ZZPOSTMARKER" not in r.stdout
+
+
+class TestOutputsUI:
+    def _window(self, monkeypatch, tmp_path):
+        from PySide6.QtCore import QSettings
+        w = photoscribe.PhotoScribe()
+        w.settings = QSettings(str(tmp_path / "prefs.ini"), QSettings.IniFormat)
+        return w
+
+    def _done_photo(self, path, posts):
+        p = PhotoItem(filepath=str(path), filename=path.name)
+        p.status = "done"
+        p.metadata = PhotoMetadata(title="T", caption="C", keywords=["k"],
+                                   posts=dict(posts))
+        return p
+
+    def test_settings_persist(self, qapp, monkeypatch, tmp_path):
+        w = self._window(monkeypatch, tmp_path)
+        w.file_style_combo.setCurrentIndex(w.file_style_combo.findData("stock"))
+        w.post_checks["instagram"].setChecked(True)
+        w.post_checks["alt_text"].setChecked(True)
+        w.first_person_check.setChecked(True)
+        w._save_settings()
+        for cb in w.post_checks.values():
+            cb.setChecked(False)
+        w.file_style_combo.setCurrentIndex(0)
+        w.first_person_check.setChecked(False)
+        w._load_settings()
+        assert w.file_style_combo.currentData() == "stock"
+        assert w._selected_post_targets() == ["instagram", "alt_text"]
+        assert w.first_person_check.isChecked()
+
+    def test_first_person_disabled_without_posts(self, qapp, monkeypatch, tmp_path):
+        w = self._window(monkeypatch, tmp_path)
+        for cb in w.post_checks.values():
+            cb.setChecked(False)
+        assert not w.first_person_check.isEnabled()
+        w.post_checks["facebook"].setChecked(True)
+        assert w.first_person_check.isEnabled()
+
+    def test_only_boxes_with_posts_are_shown(self, qapp, monkeypatch, tmp_path):
+        w = self._window(monkeypatch, tmp_path)
+        photo = self._done_photo(tmp_path / "a.jpg", {"instagram": "Hello #x"})
+        monkeypatch.setattr(w, "_load_preview", lambda fp: None)
+        w._load_detail(photo)
+        assert not w.post_boxes["instagram"][0].isHidden()
+        assert w.post_boxes["facebook"][0].isHidden()
+        assert not w.posts_header.isHidden()
+        assert w.post_boxes["instagram"][1].toPlainText() == "Hello #x"
+
+    def test_char_count_turns_red_over_limit(self, qapp, monkeypatch, tmp_path):
+        w = self._window(monkeypatch, tmp_path)
+        edit, count = w.post_boxes["threads_bluesky"][1], w.post_boxes["threads_bluesky"][2]
+        edit.setPlainText("x" * 301)
+        assert count.text() == "301 / 300"
+        assert "#e2796a" in count.styleSheet()
+
+    def test_copy_button_copies(self, qapp, monkeypatch, tmp_path):
+        from PySide6.QtWidgets import QApplication
+        w = self._window(monkeypatch, tmp_path)
+        _, edit, _, btn = w.post_boxes["mastodon"]
+        edit.setPlainText("Surf at dusk #GoldenHour")
+        btn.click()
+        assert QApplication.clipboard().text() == "Surf at dusk #GoldenHour"
+
+    def test_post_edits_sync_back(self, qapp, monkeypatch, tmp_path):
+        w = self._window(monkeypatch, tmp_path)
+        photo = self._done_photo(tmp_path / "a.jpg", {"instagram": "old"})
+        w.photos = [photo]
+        monkeypatch.setattr(w, "_load_preview", lambda fp: None)
+        w._current_result_index = 0
+        w._load_detail(photo)
+        # The Results tab isn't on screen here, which is the case that used
+        # to drop edits when the check was isVisible().
+        w.post_boxes["instagram"][1].setPlainText("edited")
+        assert photo.metadata.posts["instagram"] == "edited"
+
+    def test_progress_round_trip_keeps_posts(self, qapp, monkeypatch, tmp_path):
+        w = self._window(monkeypatch, tmp_path)
+        img = tmp_path / "a.jpg"
+        w.photos = [self._done_photo(img, {"alt_text": "A bench"})]
+        w._save_progress()
+        w.photos = [PhotoItem(filepath=str(img), filename="a.jpg")]
+        assert w._load_progress([str(img)]) == 1
+        assert w.photos[0].metadata.posts == {"alt_text": "A bench"}
+
+    def test_csv_round_trip_keeps_posts(self, qapp, monkeypatch, tmp_path):
+        w = self._window(monkeypatch, tmp_path)
+        img = tmp_path / "a.jpg"
+        w.photos = [self._done_photo(img, {"instagram": "Hi #x", "alt_text": "A"})]
+        csv_path = str(tmp_path / "out.csv")
+        monkeypatch.setattr(photoscribe.QFileDialog, "getSaveFileName",
+                            lambda *a, **k: (csv_path, ""))
+        monkeypatch.setattr(photoscribe.QFileDialog, "getOpenFileName",
+                            lambda *a, **k: (csv_path, ""))
+        monkeypatch.setattr(photoscribe.QMessageBox, "information",
+                            lambda *a, **k: None)
+        w._export_csv()
+        header = open(csv_path, encoding="utf-8").readline()
+        assert "Post: Instagram" in header and "Post: Alt text" in header
+        assert "Post: Facebook" not in header
+        w.photos = [PhotoItem(filepath=str(img), filename="a.jpg")]
+        w._import_csv()
+        assert w.photos[0].metadata.posts == {"instagram": "Hi #x", "alt_text": "A"}
+
+
+# ── Posts on demand, slow-model warning, recommender (v1.7.0) ─────
+
+class TestPostsOnDemand:
+    """Results → Write posts writes posts for one finished photo, leaving
+    its title, caption and keywords alone."""
+
+    def _done(self, path="x.jpg"):
+        p = PhotoItem(filepath=path, filename=path)
+        p.status = "done"
+        p.metadata = PhotoMetadata(title="Bench at Gerringong", caption="A bench.",
+                                   keywords=["bench"], posts={"facebook": "keep me"})
+        return p
+
+    def test_posts_only_prompt_skips_metadata_request(self, monkeypatch):
+        monkeypatch.setattr(MetadataWriter, "read_persons", lambda f: [])
+        monkeypatch.setattr(MetadataWriter, "read_keywords", lambda f: [])
+        w = make_worker(describe_people=False, post_targets=["instagram"],
+                        posts_only=True, file_style="stock",
+                        keywords_list=["seascape"])
+        prompt = w._build_prompt(self._done())
+        assert 'Title: "Bench at Gerringong"' in prompt       # keeps it consistent
+        assert "Describe the photo." not in prompt             # user prompt skipped
+        assert "stock photography" not in prompt               # file style skipped
+        assert "seascape" not in prompt                        # vocab is for keywords
+        assert '{"posts": {"instagram": "..."}}' in prompt
+
+    def test_posts_only_schema_is_just_posts(self):
+        w = make_worker(post_targets=["alt_text"], posts_only=True)
+        sch = w._schema()["schema"]
+        assert sch["required"] == ["posts"]
+        assert set(sch["properties"]) == {"posts"}
+
+    def test_posts_only_needs_a_target(self):
+        assert make_worker(post_targets=[], posts_only=True).posts_only is False
+
+    def test_run_processes_a_done_photo_and_returns_only_posts(self, qapp, monkeypatch):
+        monkeypatch.setattr(MetadataWriter, "read_persons", lambda f: [])
+        monkeypatch.setattr(MetadataWriter, "read_keywords", lambda f: [])
+        photo = self._done()
+        w = make_worker(photos=[photo], backend="openai",
+                        post_targets=["instagram"], posts_only=True)
+        monkeypatch.setattr(w, "_encode_image", lambda fp: "img")
+        monkeypatch.setattr(w, "_call_openai", lambda img, prompt:
+                            json.dumps({"posts": {"instagram": "Hi #x"}}))
+        out = []
+        w.result.connect(lambda i, r: out.append(r))
+        w.run()
+        assert len(out) == 1 and out[0].posts == {"instagram": "Hi #x"}
+        assert out[0].title == ""            # nothing but posts comes back
+
+    def test_ui_merges_posts_and_keeps_metadata(self, qapp, monkeypatch, tmp_path):
+        from PySide6.QtCore import QSettings
+        w = photoscribe.PhotoScribe()
+        w.settings = QSettings(str(tmp_path / "p.ini"), QSettings.IniFormat)
+        photo = self._done(str(tmp_path / "a.jpg"))
+        w.photos = [photo]
+        w._current_result_index = 0
+        monkeypatch.setattr(w, "_load_preview", lambda fp: None)
+        w._posts_photo = photo
+        w._on_posts_result(0, PhotoMetadata(posts={"instagram": "new"}))
+        assert photo.metadata.posts == {"facebook": "keep me", "instagram": "new"}
+        assert photo.metadata.title == "Bench at Gerringong"
+        assert photo.metadata.keywords == ["bench"]
+
+    def test_write_posts_button_state(self, qapp, monkeypatch, tmp_path):
+        from PySide6.QtCore import QSettings
+        w = photoscribe.PhotoScribe()
+        w.settings = QSettings(str(tmp_path / "p.ini"), QSettings.IniFormat)
+        for cb in w.post_checks.values():
+            cb.setChecked(False)
+        w.photos = [self._done(str(tmp_path / "a.jpg"))]
+        w._current_result_index = 0
+        monkeypatch.setattr(w, "_load_preview", lambda fp: None)
+        w._load_detail(w.photos[0])
+        assert not w.write_posts_btn.isEnabled()          # nothing ticked
+        w.post_checks["instagram"].setChecked(True)
+        assert w.write_posts_btn.isEnabled()
+        assert w.write_posts_btn.text() == "Rewrite posts"  # already has one
+
+    def test_batch_skips_posts_unless_asked(self, qapp, monkeypatch, tmp_path):
+        from PySide6.QtCore import QSettings
+        monkeypatch.setattr(photoscribe.OllamaWorker, "start", lambda self: None)
+        w = photoscribe.PhotoScribe()
+        w.settings = QSettings(str(tmp_path / "p.ini"), QSettings.IniFormat)
+        w.model_combo.addItem("m")
+        w.photos = [PhotoItem(filepath="a.jpg", filename="a.jpg")]
+        w.post_checks["instagram"].setChecked(True)
+        w.batch_posts_check.setChecked(False)
+        w._start_processing()
+        assert w.worker.post_targets == []
+        w.batch_posts_check.setChecked(True)
+        w._start_processing()
+        assert w.worker.post_targets == ["instagram"]
+
+
+class TestSlowModelWarning:
+    def _worker(self, monkeypatch):
+        monkeypatch.setattr(OllamaWorker, "_slow_warned", False)
+        w = make_worker(model="big-model")
+        logs = []
+        w.log_message.connect(logs.append)
+        return w, logs
+
+    def test_warns_when_slow(self, monkeypatch):
+        w, logs = self._worker(monkeypatch)
+        w._last_rate = (110, 20.0)          # 5.5 tok/s, measured on a 26B-A4B
+        w._check_speed()
+        assert any("Slow generation: 5.5 tokens a second" in m for m in logs)
+        assert any("big-model" in m for m in logs)
+
+    def test_quiet_when_healthy(self, monkeypatch):
+        w, logs = self._worker(monkeypatch)
+        w._last_rate = (132, 9.4)           # 14 tok/s, a model that fits
+        w._check_speed()
+        assert logs == []
+
+    def test_short_answers_are_not_judged(self, monkeypatch):
+        w, logs = self._worker(monkeypatch)
+        w._last_rate = (30, 10.0)           # alt text only: start-up dominates
+        w._check_speed()
+        assert logs == []
+
+    def test_warns_once_per_session(self, monkeypatch):
+        w, logs = self._worker(monkeypatch)
+        w._last_rate = (110, 20.0)
+        w._check_speed()
+        w._check_speed()
+        make_worker()._check_speed()
+        assert len(logs) == 1
+
+    def test_openai_call_records_rate(self, monkeypatch):
+        payload = {"choices": [{"finish_reason": "stop", "message": {"content": "{}"}}],
+                   "usage": {"completion_tokens": 120}}
+        monkeypatch.setattr(photoscribe.requests, "post",
+                            lambda url, json=None, timeout=None: _Resp(payload=payload))
+        w = make_worker(backend="openai")
+        w._call_openai("img", "p")
+        assert w._last_rate[0] == 120 and w._last_rate[1] >= 0
+
+    def test_ollama_call_uses_reported_timing(self, monkeypatch):
+        payload = {"message": {"content": "{}"}, "eval_count": 100,
+                   "eval_duration": 5_000_000_000}
+        monkeypatch.setattr(photoscribe.requests, "post",
+                            lambda url, json=None, timeout=None: _Resp(payload=payload))
+        w = make_worker(backend="ollama")
+        w._call_ollama("img", "p")
+        assert w._last_rate == (100, 5.0)
+
+
+class TestModelRecommendation:
+    def _rec(self, qapp, **info):
+        w = photoscribe.PhotoScribe()
+        return w._get_model_recommendation(info)
+
+    def test_32gb_mac_gets_12b_not_a_big_model(self, qapp):
+        # The case measured: 27B and 26B-A4B both paged to disk on 32GB.
+        r = self._rec(qapp, ram_mb=32768, vram_mb=22937, platform="apple_silicon")
+        assert r["model"] == "gemma4:12b-it-qat"
+
+    def test_big_mac_gets_moe(self, qapp):
+        r = self._rec(qapp, ram_mb=64 * 1024, vram_mb=45000, platform="apple_silicon")
+        assert r["model"] == "gemma4:26b-a4b-it-qat"
+
+    def test_12gb_card_gets_12b(self, qapp):
+        # Previously sent to the 4B; the 12B is 7.2GB and fits.
+        r = self._rec(qapp, ram_mb=96 * 1024, vram_mb=12 * 1024, platform="nvidia")
+        assert r["model"] == "gemma4:12b-it-qat"
+
+    def test_6gb_card_gets_e2b(self, qapp):
+        r = self._rec(qapp, ram_mb=16 * 1024, vram_mb=6 * 1024, platform="nvidia")
+        assert r["model"] == "gemma4:e2b-it-qat"
+
+    def test_no_gemma3_left(self, qapp):
+        for ram in (8, 16, 24, 32, 48, 64):
+            r = self._rec(qapp, ram_mb=ram * 1024, vram_mb=0, platform="apple_silicon")
+            assert "gemma3" not in r["model"] and r["pull"].startswith("ollama pull gemma4:")

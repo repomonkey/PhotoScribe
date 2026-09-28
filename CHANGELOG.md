@@ -2,6 +2,23 @@
 
 All notable changes to PhotoScribe are recorded here. Dates are ISO (YYYY-MM-DD).
 
+## [1.7.0] — 2026-09-28
+
+### Added
+- **Captions for different destinations.** A new Outputs card chooses what the caption written into the photo is for. Catalogue is the existing factual style and stays the default. Stock writes literal titles, 25 to 45 keywords ordered most important first, no brand names or subjective praise, and uses the editorial caption format when a photo shows identifiable people or brands. Flickr writes a gallery-style description and tags, since Flickr reads them from the file on upload.
+- **Ready-to-paste posts for Instagram, Facebook, Threads / Bluesky and Mastodon, plus alt text.** Tick the ones you want, then press **Write posts** on a photo in Results to write them for that photo, without touching its title, caption or keywords. Most photos in a batch never get posted, so this keeps Generate fast. To write them for every photo during Generate instead, tick *Write posts for every photo during Generate*. Each post has a copy button and a character count that turns red past that platform's limit, and posts are included in CSV exports and restored with saved progress. They are never written into the photo: those platforms strip embedded metadata on upload, and hashtags don't belong in a catalogue. Mastodon hashtags are written in CamelCase so screen readers can say them.
+- **An option to write posts in the first person**, as the photographer sharing their own photo. It is limited to reactions to the photo itself; the model is told not to invent when you were there, what you did, or that it's a favourite spot, which it did readily in testing until told otherwise.
+- **Copy buttons on Title, Caption and Keywords** in Results as well.
+- **A warning when generation is crawling.** If the model writes fewer than 8 tokens a second, the log says so once and explains why: it almost always means the model is too big for the memory available and is being read back from disk as it runs. Measured on a 32GB M2 Max, Gemma 4 12B ran at 33 tokens a second and held it, while a 27B and a 26B-A4B that didn't fit ran at 3 to 6. Nothing errors in that state, so without the warning it just looks like PhotoScribe is slow.
+
+### Changed
+- **Recommend Model now suggests Gemma 4, and leaves real headroom.** It previously named Gemma 3 and counted 70% of a Mac's memory as usable, ignoring Lightroom and everything else running. It now recommends Gemma 4 E2B, E4B, 12B or the 26B-A4B mixture-of-experts model by total memory: 12B for 24 to 32GB Macs and 12 to 16GB graphics cards, 26B-A4B from 48GB or a 24GB card. 12GB cards were previously sent to the 4B, though the 12B fits them easily. On a Mac it now advises an MLX build in LM Studio rather than Q4_K_M, which is the GGUF term.
+- When several models are available, a Gemma 4 12B is selected by default.
+- The Results detail panel now scrolls, so a photo with several posts fits, and the preview no longer pushes the right-hand edge out of view.
+
+### Internal
+- The test suite no longer reads or writes your real PhotoScribe settings. The app opens its preferences with a Qt constructor that always uses the system store, so tests were loading live settings and failed once posts were ticked. They now get a throwaway settings file.
+
 ## [1.6.3] — 2026-07-19
 
 ### Fixed
