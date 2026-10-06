@@ -150,6 +150,18 @@ Tick **Use folder context** and PhotoScribe reads your folder names to pre-fill 
 - **Use EXIF date as fallback** — when no date is in the folder name, reads `DateTimeOriginal` from the photo instead.
 - **Look up location from GPS coordinates** *(opt-in, off by default)* — if a photo has GPS data, looks up a place name via OpenStreetMap. Because this sends coordinates to an external service, the first time you enable it PhotoScribe asks you to confirm. Everything else stays on your machine.
 
+### Adding GPS to photos from cameras without it
+
+Many cameras (the Fujifilm X-T4 among them) have no GPS, so their photos carry no coordinates. PhotoScribe can write them in two ways, both in the Batch Context card. Neither touches a photo that already has GPS.
+
+For one place across the whole batch, type a place into Location and press **Look up** next to the GPS fields. PhotoScribe asks OpenStreetMap for the coordinates (the first time, it asks your permission, since the place name you typed leaves your computer) and fills in latitude and longitude. After that, lookups happen on their own a moment after you stop typing. You can also type or paste coordinates yourself, for example from a pin dropped in Apple or Google Maps. They're written to every photo when you press **Write Metadata to Files**.
+
+To give each photo its own position, record a track on your phone while you shoot, with any app that exports GPX (Strava, Gaia GPS, myTracks and Geotag Photos Pro all do), then press **Load GPX…**. PhotoScribe matches each photo's capture time to the track and gives it the position you were at when you took it, interpolating between track points. The status line shows how many photos matched. A track match takes priority over the GPS fields, so photos outside the track still get the batch coordinates if you've set them.
+
+Matching depends on the camera's clock. Cameras record local time without a time zone, so PhotoScribe uses the zone saved in the photo if there is one, and otherwise this computer's. If you travelled without changing the camera's zone, set **Camera clock** to the zone the camera was on. If nothing matches, that's almost always the cause. It's worth syncing the camera clock to your phone before a shoot; a camera running a few minutes fast places photos a few minutes along the track.
+
+With **Look up location from GPS coordinates** ticked, matched photos also get a place name in their caption and keywords, exactly as photos from a GPS-equipped camera do.
+
 ### Folder presets
 
 In the **Folder Presets** tab you can define rules: *if a folder name contains X, auto-apply a prompt preset or a keyword list.* Useful for recurring subjects — e.g. a folder containing "wedding" applies your Event preset and wedding vocabulary automatically. First matching rule wins.

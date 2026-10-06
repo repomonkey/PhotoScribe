@@ -809,7 +809,7 @@ class TestPerPhotoLocation:
         monkeypatch.setattr(MetadataWriter, "read_persons", lambda f: [])
         monkeypatch.setattr(MetadataWriter, "read_keywords", lambda f: [])
         monkeypatch.setattr(photoscribe, "resolve_photo_location",
-                            lambda fp: "Gerroa, New South Wales, Australia")
+                            lambda fp, coords=None: "Gerroa, New South Wales, Australia")
         w = make_worker(describe_people=False, gps_lookup=True)
         photo = PhotoItem(filepath="x.cr2", filename="x.cr2")
         prompt = w._build_prompt(photo)
@@ -821,7 +821,7 @@ class TestPerPhotoLocation:
         monkeypatch.setattr(MetadataWriter, "read_keywords", lambda f: [])
         called = []
         monkeypatch.setattr(photoscribe, "resolve_photo_location",
-                            lambda fp: called.append(fp) or "Gerroa")
+                            lambda fp, coords=None: called.append(fp) or "Gerroa")
         w = make_worker(describe_people=False, gps_lookup=False)
         prompt = w._build_prompt(PhotoItem(filepath="x.cr2", filename="x.cr2"))
         assert "Gerroa" not in prompt
@@ -831,7 +831,7 @@ class TestPerPhotoLocation:
         monkeypatch.setattr(MetadataWriter, "read_persons", lambda f: [])
         monkeypatch.setattr(MetadataWriter, "read_keywords", lambda f: [])
         monkeypatch.setattr(photoscribe, "resolve_photo_location",
-                            lambda fp: "Gerroa")
+                            lambda fp, coords=None: "Gerroa")
         w = make_worker(describe_people=False, gps_lookup=True,
                         context="Location: Berry, NSW", has_manual_location=True)
         prompt = w._build_prompt(PhotoItem(filepath="x.cr2", filename="x.cr2"))
@@ -843,7 +843,7 @@ class TestPerPhotoLocation:
         monkeypatch.setattr(MetadataWriter, "read_keywords", lambda f: [])
         places = {"a.cr2": "Gerroa, Australia", "b.cr2": "Comillas, Spain"}
         monkeypatch.setattr(photoscribe, "resolve_photo_location",
-                            lambda fp: places[fp])
+                            lambda fp, coords=None: places[fp])
         w = make_worker(describe_people=False, gps_lookup=True)
         pa = w._build_prompt(PhotoItem(filepath="a.cr2", filename="a.cr2"))
         pb = w._build_prompt(PhotoItem(filepath="b.cr2", filename="b.cr2"))

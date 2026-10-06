@@ -2,6 +2,14 @@
 
 All notable changes to PhotoScribe are recorded here. Dates are ISO (YYYY-MM-DD).
 
+## [1.8.0] — 2026-10-06
+
+### Added
+- **GPS for photos from cameras that don't record it.** New GPS and Track rows in Batch Context write coordinates into photos that have none. Photos that already carry GPS always keep their own. Coordinates go into the file's EXIF, or into the XMP sidecar when writing sidecars for RAW files.
+- **Coordinates for a whole batch.** Type latitude and longitude, or press **Look up** to find them for the place typed into Location via OpenStreetMap. The first lookup asks permission, because the place name is sent to an outside service. After that, coordinates are looked up automatically a moment after you finish typing a location. Locations PhotoScribe fills in from folder names are never looked up automatically, so a folder called "Berry" can't quietly geotag a batch to Berry, Kentucky.
+- **Per-photo positions from a GPX track.** Record a track on your phone while shooting, then press **Load GPX…** (several files at once is fine). Each photo's capture time is matched to the track, interpolating between points up to 10 minutes apart and otherwise accepting a point within 2 minutes, and the status line reports how many photos matched. A track match is used ahead of the batch coordinates. **Camera clock** sets the zone the camera's clock was on, for when it was left on home time while travelling; Auto uses the zone saved in the photo, then this computer's.
+- With *Look up location from GPS coordinates* ticked, photos matched to a track get a place name in their caption and keywords, as photos from a GPS camera already did.
+
 ## [1.7.0] — 2026-09-28
 
 ### Added

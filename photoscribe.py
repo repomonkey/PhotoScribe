@@ -20,7 +20,8 @@ from pathlib import Path
 from io import BytesIO
 from dataclasses import dataclass, field
 from typing import Optional
-from datetime import datetime as _datetime
+from datetime import datetime as _datetime, timezone, timedelta
+import bisect
 
 import requests
 from PIL import Image
@@ -60,7 +61,7 @@ def _popen(*args, **kwargs):
 
 
 # Single source of truth for the app version (the build reads this too).
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.8.0"
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGridLayout, QLabel, QPushButton, QTextEdit, QLineEdit, QComboBox,
@@ -359,6 +360,7 @@ def read_location_fields(filepath: str) -> Optional[str]:
 # that results be cached. Photos from one shoot share a location, so caching
 # on rounded coordinates (4dp ≈ 11m) turns a whole folder into one request.
 _geocode_cache = {}
+_forward_geocode_cache = {}
 _geocode_lock = threading.Lock()
 _geocode_last_call = 0.0
 _GEOCODE_MIN_INTERVAL = 1.0
@@ -424,7 +426,43 @@ def _reverse_geocode_uncached(lat: float, lon: float) -> Optional[str]:
     return None
 
 
-def resolve_photo_location(filepath: str) -> Optional[str]:
+def forward_geocode(place_name: str) -> Optional[tuple]:
+    """Forward geocode a place name to (lat, lon) via Nominatim.
+    Returns (latitude, longitude) as floats, or None.
+    Rate-limited and cached per Nominatim usage policy.
+    """
+    global _geocode_last_call
+    key = place_name.strip().lower()
+    if not key:
+        return None
+    with _geocode_lock:
+        if key in _forward_geocode_cache:
+            return _forward_geocode_cache[key]
+        wait = _GEOCODE_MIN_INTERVAL - (time.monotonic() - _geocode_last_call)
+        if wait > 0:
+            time.sleep(wait)
+        result = None
+        try:
+            resp = requests.get(
+                "https://nominatim.openstreetmap.org/search",
+                params={"q": place_name, "format": "json",
+                        "limit": 1, "accept-language": "en"},
+                timeout=10,
+                headers={"User-Agent": "PhotoScribe/1.0 (photo metadata tool)"}
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if data:
+                result = (float(data[0]["lat"]), float(data[0]["lon"]))
+        except Exception:
+            pass
+        _geocode_last_call = time.monotonic()
+        _forward_geocode_cache[key] = result
+        return result
+
+
+def resolve_photo_location(filepath: str,
+                           fallback_coords: Optional[tuple] = None) -> Optional[str]:
     """The place this one photo was taken, or None.
 
     Prefers the place name a cataloguer (e.g. Lightroom) already resolved into
@@ -436,7 +474,7 @@ def resolve_photo_location(filepath: str) -> Optional[str]:
     place = read_location_fields(filepath)
     if place:
         return place
-    coords = read_gps_coordinates(filepath)
+    coords = read_gps_coordinates(filepath) or fallback_coords
     if coords:
         return reverse_geocode(coords[0], coords[1])
     return None
@@ -450,6 +488,138 @@ def resolve_photo_date(filepath: str) -> Optional[str]:
     morning's date the moment a folder spans more than one moment.
     """
     return read_exif_date(filepath, with_time=True)
+
+
+# ─────────────────────────────────────────────────────────
+# GPX track matching
+# ─────────────────────────────────────────────────────────
+
+# Interpolate between two track points only if they are this close in time;
+# a longer gap means the logger lost signal or was switched off.
+GPX_MAX_INTERP_GAP = 600
+# Otherwise accept the nearest point if it is within this many seconds.
+GPX_SNAP_TOLERANCE = 120
+
+
+def _parse_gpx_time(text: str) -> float:
+    s = text.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    # fromisoformat accepts at most six fractional digits
+    s = re.sub(r"(\.\d{6})\d+", r"\1", s)
+    dt = _datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)  # the GPX spec says UTC
+    return dt.timestamp()
+
+
+def parse_gpx(path: str) -> list:
+    """Track points from a GPX file as [(epoch_seconds, lat, lon)], sorted.
+    Points without a timestamp are useless for matching and are dropped."""
+    import xml.etree.ElementTree as ET
+    points = []
+    for el in ET.parse(path).getroot().iter():
+        if el.tag.rsplit("}", 1)[-1] != "trkpt":
+            continue
+        stamp = next((c.text for c in el
+                      if c.tag.rsplit("}", 1)[-1] == "time" and c.text), None)
+        if not stamp:
+            continue
+        try:
+            points.append((_parse_gpx_time(stamp),
+                           float(el.get("lat")), float(el.get("lon"))))
+        except (TypeError, ValueError):
+            continue
+    points.sort()
+    return points
+
+
+def match_track(points: list, t: float) -> Optional[tuple]:
+    """(lat, lon) on the track at time t, or None if t falls outside it."""
+    if not points:
+        return None
+    i = bisect.bisect_left(points, (t,))
+    before = points[i - 1] if i > 0 else None
+    after = points[i] if i < len(points) else None
+    if after and after[0] == t:
+        return after[1], after[2]
+    if before and after and after[0] - before[0] <= GPX_MAX_INTERP_GAP:
+        f = (t - before[0]) / (after[0] - before[0])
+        return (before[1] + (after[1] - before[1]) * f,
+                before[2] + (after[2] - before[2]) * f)
+    near = min((q for q in (before, after) if q), key=lambda q: abs(q[0] - t))
+    if abs(near[0] - t) <= GPX_SNAP_TOLERANCE:
+        return near[1], near[2]
+    return None
+
+
+def photo_epoch(dto: str, file_offset: str = "",
+                utc_offset_hours: Optional[float] = None) -> Optional[float]:
+    """Seconds since the epoch for a camera DateTimeOriginal.
+
+    Cameras record local clock time with no zone. The zone comes from, in
+    order: the camera-clock setting the user chose (it has to win, because
+    the usual problem is a camera left on home time while travelling, and
+    then the file's own offset is wrong too), the file's OffsetTimeOriginal,
+    and finally this computer's zone on that date.
+    """
+    m = re.match(r"(\d{4}):(\d{2}):(\d{2}) (\d{2}):(\d{2}):(\d{2})", dto or "")
+    if not m:
+        return None
+    y, mo, d, h, mi, sec = map(int, m.groups())
+    hours = utc_offset_hours
+    if hours is None and file_offset:
+        om = re.match(r"([+-])(\d{2}):(\d{2})", file_offset)
+        if om:
+            hours = int(om.group(2)) + int(om.group(3)) / 60
+            if om.group(1) == "-":
+                hours = -hours
+    try:
+        if hours is not None:
+            tz = timezone(timedelta(hours=hours))
+            return _datetime(y, mo, d, h, mi, sec, tzinfo=tz).timestamp()
+        return time.mktime((y, mo, d, h, mi, sec, 0, 0, -1))
+    except (ValueError, OverflowError):
+        return None
+
+
+def _path_key(path: str) -> str:
+    return os.path.normcase(os.path.normpath(path))
+
+
+def read_capture_times(filepaths: list) -> dict:
+    """{path_key: (DateTimeOriginal, OffsetTimeOriginal)} for many files,
+    in as few ExifTool calls as possible."""
+    exiftool = MetadataWriter.find_exiftool()
+    if not exiftool:
+        return {}
+    out = {}
+    for start in range(0, len(filepaths), 200):
+        chunk = filepaths[start:start + 200]
+        try:
+            r = _run([exiftool, "-j", "-DateTimeOriginal",
+                      "-OffsetTimeOriginal", *chunk],
+                     capture_output=True, text=True, timeout=120)
+            # A non-zero exit can still carry rows for the files that worked
+            for row in json.loads(r.stdout or "[]"):
+                out[_path_key(row.get("SourceFile", ""))] = (
+                    str(row.get("DateTimeOriginal", "")),
+                    str(row.get("OffsetTimeOriginal", "")))
+        except Exception:
+            continue
+    return out
+
+
+# Camera clock zones offered in the GPX row, as hours from UTC.
+GPX_UTC_OFFSETS = sorted(set(
+    [float(h) for h in range(-12, 15)]
+    + [-9.5, -3.5, 3.5, 4.5, 5.5, 5.75, 6.5, 8.75, 9.5, 10.5, 12.75, 13.75]))
+
+
+def _fmt_utc_offset(hours: float) -> str:
+    sign = "+" if hours >= 0 else "-"
+    total = round(abs(hours) * 60)
+    return f"UTC{sign}{total // 60:02d}:{total % 60:02d}"
 
 # ─────────────────────────────────────────────────────────
 # Data structures
@@ -477,6 +647,7 @@ class PhotoItem:
     metadata: Optional[PhotoMetadata] = None
     status: str = "pending"  # pending, processing, done, error
     error_msg: str = ""
+    gpx_coords: Optional[tuple] = None  # (lat, lon) matched from a GPX track
 
 
 # ─────────────────────────────────────────────────────────
@@ -687,7 +858,8 @@ class OllamaWorker(QThread):
         # (which then applies to every photo, as an explicit override).
         photo_location = ""
         if photo and self.gps_lookup and not self.has_manual_location:
-            photo_location = resolve_photo_location(photo.filepath) or ""
+            photo_location = resolve_photo_location(
+                photo.filepath, getattr(photo, "gpx_coords", None)) or ""
             if photo_location:
                 self.log_message.emit(
                     f"Location for {photo.filename}: {photo_location}")
@@ -1679,6 +1851,7 @@ class MetadataWriter:
 
     @staticmethod
     def _write_sidecar(raw_path: Path, metadata: PhotoMetadata, adobe_naming=False,
+                       gps_coords=None,
                        skip_existing=False, append_keywords=False):
         """Write metadata to an XMP sidecar alongside the RAW file.
 
@@ -1731,6 +1904,16 @@ class MetadataWriter:
             for kw in kw_list:
                 args.append(f"-XMP-dc:Subject+={kw}")
                 args.append(f"-XMP-lr:HierarchicalSubject+={kw}")
+
+        # GPS coordinates — only write if supplied and not already present
+        if gps_coords:
+            existing_gps = read_gps_coordinates(str(raw_path))
+            if not existing_gps:
+                # XMP keeps the hemisphere inside the value ("33,51.6S"),
+                # so it takes a signed number; a separate Ref is ignored.
+                lat, lon = gps_coords
+                args.append(f"-XMP-exif:GPSLatitude={lat}")
+                args.append(f"-XMP-exif:GPSLongitude={lon}")
 
         # Nothing left to write (everything skipped) — leave the sidecar as-is
         if len(args) <= 2:
@@ -1870,7 +2053,8 @@ class MetadataWriteWorker(QThread):
     finished_writing = Signal(int, int)  # success_count, error_count
 
     def __init__(self, items, backup=True, append_keywords=False,
-                 skip_existing=False, use_sidecar=False, adobe_naming=False):
+                 skip_existing=False, use_sidecar=False, adobe_naming=False,
+                 gps_by_file=None):
         super().__init__()
         self.items = items  # list of (filepath, PhotoMetadata)
         self.backup = backup
@@ -1878,6 +2062,8 @@ class MetadataWriteWorker(QThread):
         self.skip_existing = skip_existing
         self.use_sidecar = use_sidecar
         self.adobe_naming = adobe_naming
+        # {filepath: (lat, lon)} — only written to files with no GPS yet
+        self.gps_by_file = gps_by_file or {}
 
     def run(self):
         total = len(self.items)
@@ -1980,6 +2166,7 @@ class MetadataWriteWorker(QThread):
                     adobe_naming=self.adobe_naming,
                     skip_existing=self.skip_existing,
                     append_keywords=self.append_keywords,
+                    gps_coords=self.gps_by_file.get(filepath),
                 )
                 success_count += 1
                 self.file_done.emit(os.path.basename(filepath), True, "")
@@ -2040,6 +2227,19 @@ class MetadataWriteWorker(QThread):
             for kw in kw_list:
                 arg_lines.append(f"-IPTC:Keywords={kw}")
                 arg_lines.append(f"-XMP:Subject={kw}")
+
+        # GPS coordinates — only written if supplied and file has no GPS already
+        coords = self.gps_by_file.get(filepath)
+        if coords:
+            existing_gps = read_gps_coordinates(filepath)
+            if not existing_gps:
+                lat, lon = coords
+                lat_ref = "N" if lat >= 0 else "S"
+                lon_ref = "E" if lon >= 0 else "W"
+                arg_lines.append(f"-GPSLatitude={abs(lat)}")
+                arg_lines.append(f"-GPSLatitudeRef={lat_ref}")
+                arg_lines.append(f"-GPSLongitude={abs(lon)}")
+                arg_lines.append(f"-GPSLongitudeRef={lon_ref}")
 
         return arg_lines
 
@@ -2547,6 +2747,10 @@ class StatusDot(QLabel):
 # ─────────────────────────────────────────────────────────
 
 class PhotoScribe(QMainWindow):
+    # Results from background lookups, delivered on the GUI thread
+    _geocode_done = Signal(object, str)    # (lat, lon) or None, place
+    _gpx_matched = Signal(int, object)     # run id, {filepath: coords}
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("PhotoScribe")
@@ -2961,6 +3165,102 @@ class PhotoScribe(QMainWindow):
             edit.setPlaceholderText(placeholder)
             context_layout.addWidget(edit, row, 1)
             self.context_fields[key] = edit
+
+        # GPS coordinates row (after Notes): written to photos with no GPS
+        gps_row = len(fields) + 1
+        gps_lbl = QLabel("GPS:")
+        gps_lbl.setStyleSheet("color: #8f8d89; font-size: 12px;")
+        context_layout.addWidget(gps_lbl, gps_row, 0)
+
+        gps_inner = QHBoxLayout()
+        gps_inner.setSpacing(4)
+        self.ctx_gps_lat = QLineEdit()
+        self.ctx_gps_lat.setPlaceholderText("Latitude")
+        self.ctx_gps_lat.setFixedWidth(110)
+        gps_inner.addWidget(self.ctx_gps_lat)
+        self.ctx_gps_lon = QLineEdit()
+        self.ctx_gps_lon.setPlaceholderText("Longitude")
+        self.ctx_gps_lon.setFixedWidth(110)
+        gps_inner.addWidget(self.ctx_gps_lon)
+        self.gps_status_lbl = QLabel("")
+        gps_inner.addWidget(self.gps_status_lbl)
+        gps_inner.addStretch()
+        self.gps_lookup_btn = QPushButton("Look up")
+        self.gps_lookup_btn.setFixedHeight(26)
+        self.gps_lookup_btn.setStyleSheet("font-size: 11px; padding: 2px 10px;")
+        self.gps_lookup_btn.setToolTip(
+            "Find coordinates for the Location text using OpenStreetMap.\n"
+            "Written to every photo that has no GPS and no match in a track."
+        )
+        self.gps_lookup_btn.clicked.connect(self._lookup_gps_from_location)
+        gps_inner.addWidget(self.gps_lookup_btn)
+        context_layout.addLayout(gps_inner, gps_row, 1)
+
+        # True while the coordinates came from a lookup rather than the user,
+        # so a later edit to Location can safely replace them.
+        self._gps_from_lookup = False
+        for box in (self.ctx_gps_lat, self.ctx_gps_lon):
+            box.textEdited.connect(self._on_gps_edited)
+
+        # Look up coordinates a moment after the user stops typing a place.
+        # textEdited, not textChanged: a location PhotoScribe filled in from a
+        # folder name must never be geocoded and written without a check.
+        self._gps_debounce_timer = QTimer(self)
+        self._gps_debounce_timer.setSingleShot(True)
+        self._gps_debounce_timer.setInterval(1500)
+        self._gps_debounce_timer.timeout.connect(self._auto_geocode_location)
+        self.context_fields["ctx_location"].textEdited.connect(
+            self._on_location_text_edited
+        )
+        self._geocode_done.connect(self._apply_geocode_result)
+
+        # GPX track row: per-photo positions from a phone or GPS logger
+        gpx_row = gps_row + 1
+        gpx_lbl = QLabel("Track:")
+        gpx_lbl.setStyleSheet("color: #8f8d89; font-size: 12px;")
+        context_layout.addWidget(gpx_lbl, gpx_row, 0)
+
+        gpx_inner = QHBoxLayout()
+        gpx_inner.setSpacing(4)
+        self.gpx_load_btn = QPushButton("Load GPX…")
+        self.gpx_load_btn.setFixedHeight(26)
+        self.gpx_load_btn.setStyleSheet("font-size: 11px; padding: 2px 10px;")
+        self.gpx_load_btn.setToolTip(
+            "Match each photo's capture time to a GPS track recorded on your\n"
+            "phone or a logger. Matched photos get their own coordinates."
+        )
+        self.gpx_load_btn.clicked.connect(self._load_gpx)
+        gpx_inner.addWidget(self.gpx_load_btn)
+        self.gpx_status_lbl = QLabel("")
+        self.gpx_status_lbl.setStyleSheet("color: #9a9aa0; font-size: 11px;")
+        gpx_inner.addWidget(self.gpx_status_lbl, 1)
+        clock_lbl = QLabel("Camera clock:")
+        clock_lbl.setStyleSheet("color: #8f8d89; font-size: 11px;")
+        gpx_inner.addWidget(clock_lbl)
+        self.gpx_offset_combo = QComboBox()
+        self.gpx_offset_combo.addItem("Auto", None)
+        for hours in GPX_UTC_OFFSETS:
+            self.gpx_offset_combo.addItem(_fmt_utc_offset(hours), hours)
+        self.gpx_offset_combo.setToolTip(
+            "The time zone your camera's clock is set to.\n"
+            "Auto uses the zone saved in the photo, or this computer's zone.\n"
+            "Set it if the camera was left on home time while travelling."
+        )
+        self.gpx_offset_combo.currentIndexChanged.connect(self._match_gpx)
+        gpx_inner.addWidget(self.gpx_offset_combo)
+        self.gpx_clear_btn = QPushButton("Clear")
+        self.gpx_clear_btn.setFixedHeight(26)
+        self.gpx_clear_btn.setStyleSheet("font-size: 11px; padding: 2px 10px;")
+        self.gpx_clear_btn.setVisible(False)
+        self.gpx_clear_btn.clicked.connect(self._clear_gpx)
+        gpx_inner.addWidget(self.gpx_clear_btn)
+        context_layout.addLayout(gpx_inner, gpx_row, 1)
+
+        self._gpx_points = []
+        self._gpx_files = []
+        self._gpx_match_seq = 0
+        self._gpx_matched.connect(self._apply_gpx_matches)
+
         settings_layout.addWidget(context_group)
 
         # Options
@@ -3491,6 +3791,10 @@ class PhotoScribe(QMainWindow):
         self.gps_lookup_check.blockSignals(False)
         folder_context = self.settings.value("folder_context", "true")
         self.folder_context_check.setChecked(folder_context == "true")
+        clock = self.settings.value("gpx_camera_clock", "Auto")
+        idx = self.gpx_offset_combo.findText(str(clock))
+        if idx >= 0:
+            self.gpx_offset_combo.setCurrentIndex(idx)
         exif_date_fallback = self.settings.value("exif_date_fallback", "true")
         self.exif_date_fallback_check.setChecked(exif_date_fallback == "true")
         idx = self.file_style_combo.findData(
@@ -3534,6 +3838,8 @@ class PhotoScribe(QMainWindow):
             "gps_lookup",
             "true" if self.gps_lookup_check.isChecked() else "false"
         )
+        self.settings.setValue(
+            "gpx_camera_clock", self.gpx_offset_combo.currentText())
         self.settings.setValue(
             "folder_context",
             "true" if self.folder_context_check.isChecked() else "false"
@@ -3920,6 +4226,8 @@ class PhotoScribe(QMainWindow):
         # Try to restore progress from a previous session
         self._load_progress(filepaths)
 
+        self._match_gpx()
+
         self._file_loader = None
 
     def _clear_all(self):
@@ -3937,6 +4245,8 @@ class PhotoScribe(QMainWindow):
         # Drop anything we auto-detected for the folder just cleared, so the
         # next batch starts clean instead of inheriting the last one's context.
         self._clear_folder_context()
+        self._clear_looked_up_gps()
+        self._match_gpx()  # resets the track status to "add photos"
         self._current_result_index = -1
         self._refresh_photo_table()
         self._refresh_results_table()
@@ -4105,6 +4415,186 @@ class PhotoScribe(QMainWindow):
             self.gps_lookup_check.blockSignals(True)
             self.gps_lookup_check.setChecked(False)
             self.gps_lookup_check.blockSignals(False)
+
+    def _set_gps_status(self, text, ok=None):
+        colour = {True: "#7bc9a0", False: "#e2796a"}.get(ok, "#9a9aa0")
+        self.gps_status_lbl.setText(text)
+        self.gps_status_lbl.setStyleSheet(f"color: {colour}; font-size: 11px;")
+
+    def _batch_gps_coords(self):
+        """The coordinates in the GPS fields, or None if empty or invalid."""
+        try:
+            lat = float(self.ctx_gps_lat.text().strip())
+            lon = float(self.ctx_gps_lon.text().strip())
+        except ValueError:
+            return None
+        if -90 <= lat <= 90 and -180 <= lon <= 180:
+            return lat, lon
+        return None
+
+    def _on_gps_edited(self, _text):
+        self._gps_from_lookup = False
+        lat, lon = self.ctx_gps_lat.text().strip(), self.ctx_gps_lon.text().strip()
+        if not lat and not lon:
+            self._set_gps_status("")
+        elif self._batch_gps_coords():
+            self._set_gps_status("✓", True)
+        elif lat and lon:
+            self._set_gps_status("invalid", False)
+        else:
+            self._set_gps_status("")
+
+    def _on_location_text_edited(self, text):
+        self._gps_debounce_timer.stop()
+        if not self._gps_from_lookup and (
+                self.ctx_gps_lat.text().strip() or self.ctx_gps_lon.text().strip()):
+            return  # typed by hand — leave them alone
+        if not text.strip():
+            self._clear_looked_up_gps()
+        elif self.settings.value("place_lookup_consent", "false") == "true":
+            self._gps_debounce_timer.start()
+
+    def _clear_looked_up_gps(self):
+        if self._gps_from_lookup:
+            self.ctx_gps_lat.clear()
+            self.ctx_gps_lon.clear()
+            self._gps_from_lookup = False
+            self._set_gps_status("")
+
+    def _ensure_place_lookup_consent(self):
+        if self.settings.value("place_lookup_consent", "false") == "true":
+            return True
+        reply = QMessageBox.question(
+            self, "Look Up Coordinates",
+            "This sends the Location text you typed to OpenStreetMap\n"
+            "(nominatim.openstreetmap.org) to find its coordinates.\n"
+            "Nothing else is sent, and never any image data.\n\n"
+            "Once allowed, coordinates are looked up automatically\n"
+            "as you type a location.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+        if reply != QMessageBox.Yes:
+            return False
+        self.settings.setValue("place_lookup_consent", "true")
+        return True
+
+    def _auto_geocode_location(self):
+        place = self.context_fields["ctx_location"].text().strip()
+        if place:
+            self._run_forward_geocode(place)
+
+    def _lookup_gps_from_location(self):
+        """Look up button — always resolves, replacing the coordinates."""
+        place = self.context_fields["ctx_location"].text().strip()
+        if not place:
+            self._set_gps_status("enter a location first", False)
+            return
+        if not self._ensure_place_lookup_consent():
+            return
+        self._run_forward_geocode(place)
+
+    def _run_forward_geocode(self, place):
+        self._set_gps_status("looking up…")
+        self.gps_lookup_btn.setEnabled(False)
+
+        def _worker():
+            self._geocode_done.emit(forward_geocode(place), place)
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _apply_geocode_result(self, result, place):
+        self.gps_lookup_btn.setEnabled(True)
+        if place != self.context_fields["ctx_location"].text().strip():
+            return  # the location changed while this was in flight
+        if result:
+            self.ctx_gps_lat.setText(f"{result[0]:.6f}")
+            self.ctx_gps_lon.setText(f"{result[1]:.6f}")
+            self._gps_from_lookup = True
+            self._set_gps_status("✓ found", True)
+        else:
+            self._set_gps_status("not found", False)
+
+    # ── GPX tracks ──
+
+    def _load_gpx(self):
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Load GPS Track", "", "GPS tracks (*.gpx);;All files (*)")
+        if not paths:
+            return
+        points, failed = [], []
+        for path in paths:
+            try:
+                points.extend(parse_gpx(path))
+            except Exception as e:
+                failed.append(os.path.basename(path))
+                self.log(f"Could not read {os.path.basename(path)}: {e}")
+        if not points:
+            QMessageBox.warning(
+                self, "No Track Points",
+                "No timestamped track points were found in the selected "
+                "file(s). PhotoScribe needs a recorded track (trkpt with "
+                "time), not just waypoints or a planned route.")
+            return
+        self._gpx_points = sorted(points)
+        self._gpx_files = [os.path.basename(x) for x in paths if
+                           os.path.basename(x) not in failed]
+        first = _datetime.fromtimestamp(self._gpx_points[0][0])
+        last = _datetime.fromtimestamp(self._gpx_points[-1][0])
+        self.log(f"Loaded GPS track: {len(self._gpx_points):,} points, "
+                 f"{first:%d %b %Y %H:%M} to {last:%d %b %Y %H:%M} "
+                 f"(this computer's time)")
+        self.gpx_clear_btn.setVisible(True)
+        self._match_gpx()
+
+    def _clear_gpx(self):
+        self._gpx_points, self._gpx_files = [], []
+        self._gpx_match_seq += 1  # drop any match still running
+        for p in self.photos:
+            p.gpx_coords = None
+        self.gpx_status_lbl.setText("")
+        self.gpx_clear_btn.setVisible(False)
+        self.log("Cleared GPS track")
+
+    def _match_gpx(self, *_):
+        """Match every loaded photo against the track, off the GUI thread."""
+        if not self._gpx_points:
+            return
+        names = ", ".join(self._gpx_files) or "track"
+        if not self.photos:
+            self.gpx_status_lbl.setText(f"{names} · add photos to match")
+            return
+        self._gpx_match_seq += 1
+        run_id = self._gpx_match_seq
+        points = self._gpx_points
+        offset = self.gpx_offset_combo.currentData()
+        paths = [p.filepath for p in self.photos]
+        self.gpx_status_lbl.setText(f"{names} · matching…")
+
+        def _worker():
+            times = read_capture_times(paths)
+            result = {}
+            for path in paths:
+                dto, file_offset = times.get(_path_key(path), ("", ""))
+                t = photo_epoch(dto, file_offset, offset)
+                result[path] = match_track(points, t) if t is not None else None
+            self._gpx_matched.emit(run_id, result)
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _apply_gpx_matches(self, run_id, result):
+        if run_id != self._gpx_match_seq:
+            return  # superseded by a newer match or a cleared track
+        matched = 0
+        for p in self.photos:
+            if p.filepath in result:
+                p.gpx_coords = result[p.filepath]
+                matched += p.gpx_coords is not None
+        considered = sum(1 for p in self.photos if p.filepath in result)
+        names = ", ".join(self._gpx_files) or "track"
+        self.gpx_status_lbl.setText(
+            f"{names} · matched {matched} of {considered} photos")
+        self.log(f"GPS track: matched {matched} of {considered} photos")
+        if considered and not matched:
+            self.log("  No photo times fall inside the track. If the camera "
+                     "clock is set to a different time zone from this "
+                     "computer, choose it under Camera clock.")
 
     def _on_folder_context_toggled(self, state):
         """Handle folder context checkbox toggle."""
@@ -4681,6 +5171,18 @@ class PhotoScribe(QMainWindow):
         if use_sidecar and raw_count:
             sidecar_note = f"\nRAW files ({raw_count}): metadata written to XMP sidecar."
 
+        from_track = sum(1 for p in completed if p.gpx_coords)
+        batch_gps = self._batch_gps_coords()
+        gps_note = ""
+        if from_track or batch_gps:
+            parts = []
+            if from_track:
+                parts.append(f"{from_track} from the GPS track")
+            if batch_gps and len(completed) > from_track:
+                parts.append(f"{len(completed) - from_track} from the GPS field")
+            gps_note = ("\nGPS: " + ", ".join(parts)
+                        + " (photos that already have GPS keep it).")
+
         if not auto:
             reply = QMessageBox.question(
                 self, "Write Metadata",
@@ -4688,7 +5190,7 @@ class PhotoScribe(QMainWindow):
                 f"{'Backup files will be created.' if self.backup_check.isChecked() else 'WARNING: No backup will be created!'}\n"
                 f"{'Keywords will be appended to existing.' if self.append_keywords_check.isChecked() else 'Keywords will replace existing.'}\n"
                 f"{'Title/caption will be skipped if already present.' if self.skip_existing_check.isChecked() else 'Title/caption will be overwritten.'}"
-                f"{sidecar_note}",
+                f"{sidecar_note}{gps_note}",
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.Yes
             )
@@ -4705,6 +5207,15 @@ class PhotoScribe(QMainWindow):
         self.status_label.setText("Writing metadata...")
         self.write_btn.setEnabled(False)
 
+        # Per-photo coordinates: a track match first, then the GPS fields.
+        # Photos that already carry GPS keep theirs (checked at write time).
+        batch_coords = self._batch_gps_coords()
+        gps_by_file = {}
+        for p in completed:
+            coords = p.gpx_coords or batch_coords
+            if coords:
+                gps_by_file[p.filepath] = coords
+
         self._write_worker = MetadataWriteWorker(
             items=items,
             backup=self.backup_check.isChecked(),
@@ -4712,6 +5223,7 @@ class PhotoScribe(QMainWindow):
             skip_existing=self.skip_existing_check.isChecked(),
             use_sidecar=use_sidecar,
             adobe_naming=adobe_naming,
+            gps_by_file=gps_by_file,
         )
         self._write_worker.progress.connect(self._on_write_progress)
         self._write_worker.file_done.connect(self._on_write_file_done)
