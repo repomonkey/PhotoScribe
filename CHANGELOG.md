@@ -2,6 +2,11 @@
 
 All notable changes to PhotoScribe are recorded here. Dates are ISO (YYYY-MM-DD).
 
+## [1.8.1] — 2026-10-06
+
+### Fixed
+- **Look up now finds places OpenStreetMap only knows part of.** A location like "Shoalhaven River Estuary, Shoalhaven Heads" came back "not found", because OpenStreetMap has no feature by that full name. When the full text doesn't match, Look up now drops the leading parts one at a time and uses the first that does ("Shoalhaven Heads"), and the status says which part it used. It never settles for a match as broad as a state or country, since a pin in the middle of New South Wales is worse than none.
+
 ## [1.8.0] — 2026-10-06
 
 ### Added

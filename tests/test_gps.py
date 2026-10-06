@@ -178,3 +178,33 @@ class TestTrackLocationInPrompt:
         monkeypatch.setattr(photoscribe, "reverse_geocode",
                             lambda lat, lon: f"{lat},{lon}")
         assert photoscribe.resolve_photo_location("x.raf", (9.0, 9.0)) == "1.0,2.0"
+
+
+class TestForwardGeocodeFallback:
+    def stub(self, monkeypatch, known):
+        asked = []
+
+        def search(q):
+            asked.append(q)
+            return known.get(q)
+        monkeypatch.setattr(photoscribe, "_nominatim_search", search)
+        return asked
+
+    def test_full_text_wins(self, monkeypatch):
+        self.stub(monkeypatch, {"Berry, NSW": (-34.77, 150.69, 16)})
+        assert photoscribe.forward_geocode_with_fallback("Berry,  NSW ") == \
+            ((-34.77, 150.69), "Berry, NSW")
+
+    def test_drops_unknown_leading_parts(self, monkeypatch):
+        asked = self.stub(monkeypatch, {"Shoalhaven Heads": (-34.85, 150.74, 16)})
+        coords, matched = photoscribe.forward_geocode_with_fallback(
+            "Shoalhaven River Estuary, Shoalhaven Heads")
+        assert coords == (-34.85, 150.74) and matched == "Shoalhaven Heads"
+        assert asked == ["Shoalhaven River Estuary, Shoalhaven Heads",
+                         "Shoalhaven Heads"]
+
+    def test_never_falls_back_to_a_state_or_country(self, monkeypatch):
+        self.stub(monkeypatch, {"NSW, Australia": (-32.0, 147.0, 8),
+                                "Australia": (-25.0, 133.0, 4)})
+        assert photoscribe.forward_geocode_with_fallback(
+            "Nowhere Creek, NSW, Australia") == (None, "")

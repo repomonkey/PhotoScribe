@@ -2,7 +2,7 @@
 ; Builds PhotoScribe-Setup.exe
 
 #ifndef MyAppVersion
-  #define MyAppVersion "1.8.0"
+  #define MyAppVersion "1.8.1"
 #endif
 
 #define MyAppName "PhotoScribe"

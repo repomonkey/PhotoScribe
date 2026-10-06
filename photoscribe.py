@@ -61,7 +61,7 @@ def _popen(*args, **kwargs):
 
 
 # Single source of truth for the app version (the build reads this too).
-APP_VERSION = "1.8.0"
+APP_VERSION = "1.8.1"
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGridLayout, QLabel, QPushButton, QTextEdit, QLineEdit, QComboBox,
@@ -426,13 +426,11 @@ def _reverse_geocode_uncached(lat: float, lon: float) -> Optional[str]:
     return None
 
 
-def forward_geocode(place_name: str) -> Optional[tuple]:
-    """Forward geocode a place name to (lat, lon) via Nominatim.
-    Returns (latitude, longitude) as floats, or None.
-    Rate-limited and cached per Nominatim usage policy.
-    """
+def _nominatim_search(query: str) -> Optional[tuple]:
+    """(lat, lon, place_rank) for the best Nominatim match, or None.
+    Rate-limited and cached per Nominatim's usage policy."""
     global _geocode_last_call
-    key = place_name.strip().lower()
+    key = query.strip().lower()
     if not key:
         return None
     with _geocode_lock:
@@ -445,7 +443,7 @@ def forward_geocode(place_name: str) -> Optional[tuple]:
         try:
             resp = requests.get(
                 "https://nominatim.openstreetmap.org/search",
-                params={"q": place_name, "format": "json",
+                params={"q": query, "format": "jsonv2",
                         "limit": 1, "accept-language": "en"},
                 timeout=10,
                 headers={"User-Agent": "PhotoScribe/1.0 (photo metadata tool)"}
@@ -453,12 +451,47 @@ def forward_geocode(place_name: str) -> Optional[tuple]:
             resp.raise_for_status()
             data = resp.json()
             if data:
-                result = (float(data[0]["lat"]), float(data[0]["lon"]))
+                result = (float(data[0]["lat"]), float(data[0]["lon"]),
+                          int(data[0].get("place_rank", 30)))
         except Exception:
             pass
         _geocode_last_call = time.monotonic()
         _forward_geocode_cache[key] = result
         return result
+
+
+# Nominatim place_rank 16 is a town or city; anything lower is a region,
+# state or country, too broad to pin on a photo.
+_MIN_FALLBACK_RANK = 16
+
+
+def forward_geocode(place_name: str) -> Optional[tuple]:
+    """(lat, lon) for a place name, or None."""
+    hit = _nominatim_search(place_name)
+    return (hit[0], hit[1]) if hit else None
+
+
+def forward_geocode_with_fallback(place_name: str) -> tuple:
+    """((lat, lon), matched_text) or (None, "").
+
+    Tries the full text first. Places people type often have names
+    OpenStreetMap doesn't know ("Shoalhaven River Estuary, Shoalhaven
+    Heads"), so it then drops leading comma-separated parts one at a time
+    ("Shoalhaven Heads"), accepting only town-sized or smaller matches.
+    """
+    parts = [x.strip() for x in place_name.split(",") if x.strip()]
+    if not parts:
+        return None, ""
+    full = ", ".join(parts)
+    hit = _nominatim_search(full)
+    if hit:
+        return (hit[0], hit[1]), full
+    for i in range(1, len(parts)):
+        tail = ", ".join(parts[i:])
+        hit = _nominatim_search(tail)
+        if hit and hit[2] >= _MIN_FALLBACK_RANK:
+            return (hit[0], hit[1]), tail
+    return None, ""
 
 
 def resolve_photo_location(filepath: str,
@@ -2748,7 +2781,7 @@ class StatusDot(QLabel):
 
 class PhotoScribe(QMainWindow):
     # Results from background lookups, delivered on the GUI thread
-    _geocode_done = Signal(object, str)    # (lat, lon) or None, place
+    _geocode_done = Signal(object, str)    # ((lat, lon) or None, matched), place
     _gpx_matched = Signal(int, object)     # run id, {filepath: coords}
 
     def __init__(self):
@@ -4497,20 +4530,26 @@ class PhotoScribe(QMainWindow):
         self.gps_lookup_btn.setEnabled(False)
 
         def _worker():
-            self._geocode_done.emit(forward_geocode(place), place)
+            coords, matched = forward_geocode_with_fallback(place)
+            self._geocode_done.emit((coords, matched), place)
         threading.Thread(target=_worker, daemon=True).start()
 
     def _apply_geocode_result(self, result, place):
         self.gps_lookup_btn.setEnabled(True)
         if place != self.context_fields["ctx_location"].text().strip():
             return  # the location changed while this was in flight
-        if result:
-            self.ctx_gps_lat.setText(f"{result[0]:.6f}")
-            self.ctx_gps_lon.setText(f"{result[1]:.6f}")
+        coords, matched = result
+        if coords:
+            self.ctx_gps_lat.setText(f"{coords[0]:.6f}")
+            self.ctx_gps_lon.setText(f"{coords[1]:.6f}")
             self._gps_from_lookup = True
-            self._set_gps_status("✓ found", True)
+            if matched.lower() == ", ".join(
+                    x.strip() for x in place.split(",") if x.strip()).lower():
+                self._set_gps_status("✓ found", True)
+            else:
+                self._set_gps_status(f"✓ nearest: {matched}", True)
         else:
-            self._set_gps_status("not found", False)
+            self._set_gps_status("not found — try a nearby town", False)
 
     # ── GPX tracks ──
 
