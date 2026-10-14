@@ -2,6 +2,16 @@
 
 All notable changes to PhotoScribe are recorded here. Dates are ISO (YYYY-MM-DD).
 
+## [1.8.2] — 2026-10-14
+
+### Fixed
+- **Writing metadata to a large batch no longer stalls, and PhotoScribe no longer crashes when closed during a write.** Reported from Windows with a crash dump, on a batch of about 140 files. ExifTool sends its warnings down a separate channel that PhotoScribe wasn't reading. That channel holds only 4KB on Windows, so after enough warnings ExifTool stopped and waited for room that never came, and the write sat part-way through for good. Closing the window at that point shut the app down around the stuck write, which Windows reported as a crash. The warnings are now read as they arrive, so the write runs to the end. On a Mac the same stall needed about 280 files with warnings; a test batch that stopped at file 275 of 320 now writes all 320.
+- **Closing the window while work is in progress is now safe.** If metadata is still being written, PhotoScribe asks before quitting, then stops cleanly after the current file. Previously only a running Generate was waited for, so quitting during a write, a model download or a Write posts could crash on the way out.
+- **A write that fails part-way is reported as failed.** If ExifTool stopped unexpectedly, the remaining files were counted as written. They are now listed as errors.
+
+### Changed
+- **ExifTool's warnings appear in the Log.** A file that was written with a warning, such as a keyword longer than the 64 characters IPTC allows, now says so beside its entry.
+
 ## [1.8.1] — 2026-10-06
 
 ### Fixed

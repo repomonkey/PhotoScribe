@@ -1456,3 +1456,178 @@ class TestModelRecommendation:
         for ram in (8, 16, 24, 32, 48, 64):
             r = self._rec(qapp, ram_mb=ram * 1024, vram_mb=0, platform="apple_silicon")
             assert "gemma3" not in r["model"] and r["pull"].startswith("ollama pull gemma4:")
+
+
+# ── Write stalls and the crash on quit (v1.8.2) ───────────────────
+
+LONG_KW = ("a very long descriptive keyword phrase that a model might "
+           "produce for a photo of the coast")
+
+
+@needs_exiftool
+class TestWriteDoesNotStall:
+    """Reported from Windows with a crash dump: writing ~140 files 'crashed'.
+    ExifTool's warnings went to a stderr pipe nobody read; once it filled
+    (4KB on Windows) ExifTool blocked, the write stalled for good, and closing
+    the window then tore the app down around the stuck thread."""
+
+    def test_stderr_is_merged_into_the_pipe_we_read(self, monkeypatch, tmp_path):
+        seen = {}
+        real = photoscribe._popen
+
+        def spy(*a, **k):
+            seen.update(k)
+            return real(*a, **k)
+        monkeypatch.setattr(photoscribe, "_popen", spy)
+        img = make_jpeg(tmp_path / "a.jpg")
+        MetadataWriteWorker([(str(img), PhotoMetadata(title="T", caption="C",
+                                                      keywords=["k"]))],
+                            backup=False).run()
+        import subprocess
+        assert seen["stderr"] == subprocess.STDOUT
+
+    def test_many_warning_files_all_get_written(self, tmp_path):
+        # Each file draws a warning (keyword over IPTC's 64 characters). 400
+        # of them is ~90KB of warnings, past macOS's 64KB pipe as well as
+        # Windows' 4KB: on the old code this stalled at about file 275.
+        import threading
+        files = [make_jpeg(tmp_path / f"i{i:03}.jpg") for i in range(400)]
+        items = [(str(f), PhotoMetadata(title="T", caption="C",
+                                        keywords=[LONG_KW, "beach"])) for f in files]
+        w = MetadataWriteWorker(items, backup=False)
+        t = threading.Thread(target=w.run, daemon=True)
+        t.start()
+        t.join(90)
+        stalled = t.is_alive()
+        if stalled:
+            w.cancel()
+        assert not stalled, "write stalled part-way through the batch"
+        assert all(b"beach" in f.read_bytes() for f in files)
+
+    def test_warnings_are_reported_not_lost(self, qapp, tmp_path):
+        img = make_jpeg(tmp_path / "a.jpg")
+        w = MetadataWriteWorker([(str(img), PhotoMetadata(
+            title="T", caption="C", keywords=[LONG_KW]))], backup=False)
+        got = []
+        w.file_done.connect(lambda n, ok, msg: got.append((ok, msg)),
+                            photoscribe.Qt.DirectConnection)
+        w.run()
+        assert got and got[0][0] is True
+        assert "exceeds length limit" in got[0][1]
+        assert str(tmp_path) not in got[0][1]        # path trimmed off
+
+    def test_exiftool_dying_is_an_error_not_a_success(self, qapp, monkeypatch, tmp_path):
+        # End of output without {ready} used to count as "written".
+        class Dead:
+            class _In:
+                def write(self, s): pass
+                def flush(self): pass
+            class _Out:
+                def readline(self): return ""
+            stdin, stdout = _In(), _Out()
+            def poll(self): return 1
+            def wait(self, timeout=None): return 1
+            def kill(self): pass
+        monkeypatch.setattr(photoscribe, "_popen", lambda *a, **k: Dead())
+        files = [make_jpeg(tmp_path / f"d{i}.jpg") for i in range(3)]
+        w = MetadataWriteWorker([(str(f), PhotoMetadata(title="T", caption="C",
+                                                        keywords=["k"])) for f in files],
+                                backup=False)
+        got, fin = [], []
+        w.file_done.connect(lambda n, ok, msg: got.append(ok), photoscribe.Qt.DirectConnection)
+        w.finished_writing.connect(lambda ok, bad: fin.append((ok, bad)),
+                                   photoscribe.Qt.DirectConnection)
+        w.run()
+        assert got == [False, False, False]
+        assert fin == [(0, 3)]
+
+    def test_cancel_stops_the_batch_and_leaves_no_process(self, qapp, tmp_path):
+        files = [make_jpeg(tmp_path / f"c{i:03}.jpg") for i in range(200)]
+        w = MetadataWriteWorker([(str(f), PhotoMetadata(title="T", caption="C",
+                                                        keywords=["k"])) for f in files],
+                                backup=False)
+        fin = []
+        w.file_done.connect(lambda n, ok, msg: w.cancel() if len(fin) == 0 and n == "c005.jpg" else None,
+                            photoscribe.Qt.DirectConnection)
+        w.finished_writing.connect(lambda ok, bad: fin.append((ok, bad)),
+                                   photoscribe.Qt.DirectConnection)
+        w.run()
+        ok, bad = fin[0]
+        assert ok + bad == 200 and 0 < ok < 200      # stopped early, all accounted for
+        assert w._proc.poll() is not None            # ExifTool is gone
+
+    def test_static_batch_helper_does_not_pipe_unread_output(self, monkeypatch, tmp_path):
+        import subprocess
+        seen = {}
+        real = photoscribe._popen
+
+        def spy(*a, **k):
+            seen.update(k)
+            return real(*a, **k)
+        monkeypatch.setattr(photoscribe, "_popen", spy)
+        img = make_jpeg(tmp_path / "a.jpg")
+        MetadataWriter.write_metadata_batch(
+            [(str(img), PhotoMetadata(title="T", caption="C", keywords=["k"]))],
+            backup=False)
+        assert seen["stdout"] == subprocess.DEVNULL
+        assert seen["stderr"] == subprocess.DEVNULL
+
+
+class TestQuitWithThreadsRunning:
+    """Qt aborts the process if a QThread is destroyed while running, which
+    is what the crash dump showed. Closing the window must stop or outwait
+    every worker, not only the generation one."""
+
+    class _FakeThread:
+        def __init__(self, stops=True):
+            self.running, self.stops, self.cancelled = True, stops, False
+        def isRunning(self): return self.running
+        def cancel(self): self.cancelled = True
+        def wait(self, ms=None):
+            if self.stops:
+                self.running = False
+            return not self.running
+
+    def _close(self, w):
+        from PySide6.QtGui import QCloseEvent
+        e = QCloseEvent()
+        w.closeEvent(e)
+        return e
+
+    def test_write_in_progress_asks_first_and_no_keeps_the_app_open(self, qapp, monkeypatch):
+        w = photoscribe.PhotoScribe()
+        w._write_worker = self._FakeThread()
+        monkeypatch.setattr(photoscribe.QMessageBox, "question",
+                            lambda *a, **k: photoscribe.QMessageBox.No)
+        e = self._close(w)
+        assert not e.isAccepted()
+        assert w._write_worker.cancelled is False
+
+    def test_quit_anyway_cancels_and_waits_for_the_writer(self, qapp, monkeypatch):
+        w = photoscribe.PhotoScribe()
+        t = w._write_worker = self._FakeThread()
+        monkeypatch.setattr(photoscribe.QMessageBox, "question",
+                            lambda *a, **k: photoscribe.QMessageBox.Yes)
+        exits = []
+        monkeypatch.setattr(w, "_hard_exit", lambda: exits.append(1))
+        e = self._close(w)
+        assert e.isAccepted() and t.cancelled and not t.running
+        assert exits == []                           # stopped cleanly
+
+    def test_every_worker_is_stopped_not_just_generation(self, qapp, monkeypatch):
+        w = photoscribe.PhotoScribe()
+        threads = {n: self._FakeThread() for n in
+                   ("worker", "_posts_worker", "_file_loader", "_pull_thread")}
+        for n, t in threads.items():
+            setattr(w, n, t)
+        monkeypatch.setattr(w, "_hard_exit", lambda: None)
+        self._close(w)
+        assert all(not t.running for t in threads.values())
+
+    def test_a_thread_that_will_not_stop_never_reaches_qt_teardown(self, qapp, monkeypatch):
+        w = photoscribe.PhotoScribe()
+        w.worker = self._FakeThread(stops=False)     # e.g. a hung model request
+        exits = []
+        monkeypatch.setattr(w, "_hard_exit", lambda: exits.append(1))
+        self._close(w)
+        assert exits == [1]

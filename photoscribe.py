@@ -61,7 +61,7 @@ def _popen(*args, **kwargs):
 
 
 # Single source of truth for the app version (the build reads this too).
-APP_VERSION = "1.8.1"
+APP_VERSION = "1.8.2"
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGridLayout, QLabel, QPushButton, QTextEdit, QLineEdit, QComboBox,
@@ -1989,11 +1989,14 @@ class MetadataWriter:
         # Process regular items in batch mode
         if regular_items:
             try:
+                # Nothing here reads ExifTool's output, so it must not be piped:
+                # an unread pipe fills (4KB on Windows) and ExifTool then
+                # blocks forever on its next write.
                 proc = _popen(
                     [exiftool, "-stay_open", "True", "-@", "-"],
                     stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
                     encoding="utf-8",
                     errors="replace",
                 )
@@ -2097,6 +2100,29 @@ class MetadataWriteWorker(QThread):
         self.adobe_naming = adobe_naming
         # {filepath: (lat, lon)} — only written to files with no GPS yet
         self.gps_by_file = gps_by_file or {}
+        self._cancelled = False
+        self._proc = None
+
+    def cancel(self):
+        """Stop after the current file. Killing ExifTool also unblocks a
+        worker that is waiting on its output, so this can't hang on quit."""
+        self._cancelled = True
+        proc = self._proc
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _warnings_in(lines):
+        """ExifTool's warnings for one file, without the trailing ' - path'."""
+        out = []
+        for line in lines:
+            if line.lower().startswith("warning:"):
+                text = line[len("warning:"):].strip()
+                out.append(text.rsplit(" - ", 1)[0] if " - " in text else text)
+        return "; ".join(dict.fromkeys(out))
 
     def run(self):
         total = len(self.items)
@@ -2128,16 +2154,26 @@ class MetadataWriteWorker(QThread):
         # ── Process regular items using -stay_open batch mode ──
         if regular_items:
             try:
+                # stderr is merged into stdout ON PURPOSE. ExifTool sends its
+                # warnings to stderr, and a separate stderr pipe that nobody
+                # reads fills up (4KB on Windows, 64KB on macOS). ExifTool then
+                # blocks writing its next warning while we block reading
+                # stdout, and the write stalls for good part-way through a
+                # large batch. One pipe, read below, can't do that.
                 proc = _popen(
                     [exiftool, "-stay_open", "True", "-@", "-"],
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
                     encoding="utf-8",
                     errors="replace",
                 )
+                self._proc = proc
 
                 for filepath, metadata in regular_items:
+                    if self._cancelled:
+                        break
+                    stopped = False
                     try:
                         arg_lines = self._build_args_for_file(
                             filepath, metadata, exiftool
@@ -2153,11 +2189,20 @@ class MetadataWriteWorker(QThread):
                         while True:
                             line = proc.stdout.readline()
                             if not line:
+                                # End of output with no {ready}: ExifTool has
+                                # gone. Treating that as success would mark
+                                # this and every later file as written.
+                                stopped = True
                                 break
                             line = line.strip()
                             if line == "{ready}":
                                 break
                             output_lines.append(line)
+
+                        if stopped:
+                            raise RuntimeError(
+                                "cancelled" if self._cancelled
+                                else "ExifTool stopped unexpectedly")
 
                         output_text = " ".join(output_lines)
                         if ("error" in output_text.lower()
@@ -2166,7 +2211,8 @@ class MetadataWriteWorker(QThread):
 
                         success_count += 1
                         self.file_done.emit(
-                            os.path.basename(filepath), True, "")
+                            os.path.basename(filepath), True,
+                            self._warnings_in(output_lines))
 
                     except Exception as e:
                         error_count += 1
@@ -2175,6 +2221,13 @@ class MetadataWriteWorker(QThread):
 
                     progress_idx += 1
                     self.progress.emit(progress_idx, total)
+                    if stopped:
+                        raise RuntimeError(
+                            "cancelled" if self._cancelled
+                            else "ExifTool stopped unexpectedly")
+
+                if self._cancelled:
+                    raise RuntimeError("cancelled")
 
                 # Close the batch session
                 proc.stdin.write("-stay_open\nFalse\n")
@@ -2187,12 +2240,31 @@ class MetadataWriteWorker(QThread):
                     error_count += 1
                     self.file_done.emit(
                         os.path.basename(filepath), False,
-                        f"Batch process error: {e}")
+                        "cancelled" if self._cancelled
+                        else f"Batch process error: {e}")
                     progress_idx += 1
                     self.progress.emit(progress_idx, total)
 
+            finally:
+                # Never leave an ExifTool process behind, and wait for it so
+                # it is reaped rather than left as a zombie.
+                proc = self._proc
+                if proc is not None:
+                    try:
+                        if proc.poll() is None:
+                            proc.kill()
+                        proc.wait(timeout=5)
+                    except Exception:
+                        pass
+
         # ── Process sidecar items individually ──
         for filepath, metadata in sidecar_items:
+            if self._cancelled:
+                error_count += 1
+                self.file_done.emit(os.path.basename(filepath), False, "cancelled")
+                progress_idx += 1
+                self.progress.emit(progress_idx, total)
+                continue
             try:
                 MetadataWriter._write_sidecar(
                     Path(filepath), metadata,
@@ -3902,14 +3974,52 @@ class PhotoScribe(QMainWindow):
         self.settings.setValue("keywords_vocab", self.keywords_edit.toPlainText())
         self._save_folder_presets()
 
+    def _background_threads(self):
+        """Every worker thread the window may own, running or not."""
+        names = ("worker", "_posts_worker", "_write_worker", "_file_loader",
+                 "_pull_thread")
+        return [t for t in (getattr(self, n, None) for n in names) if t is not None]
+
+    def _hard_exit(self):
+        """Leave at once, skipping interpreter teardown. Only used when a
+        worker thread won't stop: tearing down with a QThread still running
+        makes Qt abort the process, which Windows reports as a crash."""
+        os._exit(0)
+
     def closeEvent(self, event):
+        writer = getattr(self, "_write_worker", None)
+        if writer is not None and writer.isRunning():
+            reply = QMessageBox.question(
+                self, "Still writing metadata",
+                "PhotoScribe is still writing metadata to your files.\n\n"
+                "Quit anyway? Files already written are fine, but the rest "
+                "won't be written.",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+            )
+            if reply != QMessageBox.Yes:
+                event.ignore()
+                return
+
         self._save_settings()
-        if self.worker and self.worker.isRunning():
-            self.worker.cancel()
-            self.worker.wait(3000)
         # Save progress if there are processed photos
         if any(p.status == "done" for p in self.photos):
             self._save_progress()
+
+        # Ask every worker to stop, then give each a moment. Closing the
+        # window used to wait only for the generation worker, so quitting
+        # during a write (or a stalled one) tore the app down around a live
+        # thread and Qt aborted: "QThread: Destroyed while thread is still
+        # running".
+        threads = self._background_threads()
+        for t in threads:
+            if t.isRunning() and hasattr(t, "cancel"):
+                t.cancel()
+        still_running = [t for t in threads if t.isRunning() and not t.wait(4000)]
+        if still_running:
+            # e.g. a model request that hasn't timed out yet. Everything worth
+            # keeping is already saved above.
+            self.settings.sync()
+            self._hard_exit()
         event.accept()
 
     # ── Logging ──
@@ -5274,7 +5384,9 @@ class PhotoScribe(QMainWindow):
 
     def _on_write_file_done(self, filename, success, error_msg):
         if success:
-            self.log(f"Wrote metadata: {filename}")
+            # On success the third value carries any ExifTool warnings.
+            note = f" (note: {error_msg})" if error_msg else ""
+            self.log(f"Wrote metadata: {filename}{note}")
         else:
             self.log(f"Error writing {filename}: {error_msg}")
 
